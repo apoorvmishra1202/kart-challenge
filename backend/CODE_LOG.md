@@ -766,6 +766,52 @@ order → httpx, product. product and coupon never import order or each other.
 
 ---
 
+## 2026-09-26: Review fixes 1/3: restore coupon and config contracts
+
+**Context:** a checklist review (read-only report first) found regressions
+against the last pushed commit `8cbe381`. The order task had changed coupon's
+API, and the plumbing task had reshaped `config`. The user confirmed the
+checklist's contract wins: `coupon.Service.Validate(ctx, code) (bool, error)`
+with `Store.Exists`.
+
+**What**
+- **C1, coupon restored to `8cbe381`:** `CodeStore` with `Exists`, and
+  `Store`/`NewStore` (the file is back to `store.go`, byte-identical).
+  `Validate` returns `(bool, error)`. Deleted `invalidError`, the
+  `InvalidCoupon()` behavior check and `coupon.ErrInvalid`.
+- **Order:** `CouponValidator` is `Validate(ctx, code) (bool, error)`. In
+  `Place`, an error becomes a wrapped internal error (500) and `!ok` becomes
+  `ErrInvalidCoupon` (422). Test fakes updated.
+- **C2:** deleted `coupon.MemoryStore`; tests use fakes.
+- **C3, config:**
+  - `Config` gains `DatabaseURL` (required, since both binaries use Postgres),
+    `DataDir` (default `./data`) and `ImportMinFiles` (via
+    `coupon.ParseMinFiles`).
+  - `Load()` returns `(Config, error)` again; `Validate` checks the new
+    fields too.
+  - `cmd/importer` uses `config.Load` and `Validate` and no longer reads the
+    environment itself. `cmd/api` handles the new `Load` error.
+- **N5:** removed the stale TODO in `coupon/service.go`.
+- **N6:** the source file names moved to
+  `coupon.SourceFileNames [SourceFiles]string`, next to `SourceFiles`. It's
+  an array, so callers get a copy.
+- **Keeping the commit working on its own:** with `MemoryStore` gone and the
+  pool not added until commit 2, `app` uses an unexported
+  `noCoupons{}.Exists → false` placeholder, keeping the previous behavior
+  (every coupon rejected). Commit 2 removes it.
+
+**Results**
+- gofmt clean; `go vet`, `go build` and `go test -race` pass.
+- `git diff 8cbe381 -- internal/coupon/` now shows only `SourceFileNames`,
+  one comment line and the tests.
+- **Importer:** without `DATABASE_URL` it fails with "config: DATABASE_URL is
+  required"; with `IMPORT_MIN_FILES=9` it fails with "must be an integer from
+  1 to 3". The API also reports `DATABASE_URL is required`.
+- **New config tests:** `Load` with all 7 variables, defaults, parse errors,
+  and `Validate` cases for the new fields.
+
+---
+
 ## Open items
 
 - Product and order APIs done. Next: wire real coupons into the API by adding

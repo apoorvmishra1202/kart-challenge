@@ -30,49 +30,41 @@ func TestIsWellFormed(t *testing.T) {
 }
 
 type fakeStore struct {
-	has   bool
-	err   error
-	calls int
+	exists bool
+	err    error
+	calls  int
 }
 
-func (f *fakeStore) Has(context.Context, string) (bool, error) {
+func (f *fakeStore) Exists(context.Context, string) (bool, error) {
 	f.calls++
-	return f.has, f.err
+	return f.exists, f.err
 }
 
 func TestServiceValidate(t *testing.T) {
 	dbDown := errors.New("db down")
 	tests := []struct {
-		name        string
-		code        string
-		store       *fakeStore
-		wantInvalid bool  // error matches ErrInvalid and reports InvalidCoupon()
-		wantErr     error // other error expected (store failure)
-		wantCalls   int
+		name      string
+		code      string
+		store     *fakeStore
+		want      bool
+		wantErr   error
+		wantCalls int
 	}{
-		{"known code", "HAPPYHRS", &fakeStore{has: true}, false, nil, 1},
-		{"unknown code", "HAPPYHRS", &fakeStore{has: false}, true, nil, 1},
-		{"too short skips store", "ABC", &fakeStore{has: true}, true, nil, 0},
-		{"too long skips store", "WAYTOOLONGCODE", &fakeStore{has: true}, true, nil, 0},
-		{"empty skips store", "", &fakeStore{has: true}, true, nil, 0},
-		{"store failure is not a verdict", "HAPPYHRS", &fakeStore{err: dbDown}, false, dbDown, 1},
+		{"known code", "HAPPYHRS", &fakeStore{exists: true}, true, nil, 1},
+		{"unknown code", "HAPPYHRS", &fakeStore{exists: false}, false, nil, 1},
+		{"too short skips store", "ABC", &fakeStore{exists: true}, false, nil, 0},
+		{"too long skips store", "WAYTOOLONGCODE", &fakeStore{exists: true}, false, nil, 0},
+		{"empty skips store", "", &fakeStore{exists: true}, false, nil, 0},
+		{"store failure is an error, not a verdict", "HAPPYHRS", &fakeStore{err: dbDown}, false, dbDown, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := NewService(tt.store).Validate(context.Background(), tt.code)
-
-			var ic interface{ InvalidCoupon() bool }
-			isInvalid := errors.Is(err, ErrInvalid)
-			reportsInvalid := errors.As(err, &ic) && ic.InvalidCoupon()
-			if isInvalid != tt.wantInvalid || reportsInvalid != tt.wantInvalid {
-				t.Errorf("err = %v: Is(ErrInvalid) = %v, InvalidCoupon() = %v, want %v",
-					err, isInvalid, reportsInvalid, tt.wantInvalid)
+			got, err := NewService(tt.store).Validate(context.Background(), tt.code)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
 			}
-			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
-				t.Errorf("err = %v, want %v", err, tt.wantErr)
-			}
-			if !tt.wantInvalid && tt.wantErr == nil && err != nil {
-				t.Errorf("err = %v, want nil", err)
+			if got != tt.want {
+				t.Errorf("Validate = %v, want %v", got, tt.want)
 			}
 			if tt.store.calls != tt.wantCalls {
 				t.Errorf("store called %d times, want %d", tt.store.calls, tt.wantCalls)
@@ -81,15 +73,15 @@ func TestServiceValidate(t *testing.T) {
 	}
 }
 
-func TestMemoryStore(t *testing.T) {
-	ctx := context.Background()
-	if ok, err := NewMemoryStore().Has(ctx, "HAPPYHRS"); ok || err != nil {
-		t.Errorf("empty store Has = %v, %v; want false, nil", ok, err)
+func TestSourceFileNames(t *testing.T) {
+	if len(SourceFileNames) != SourceFiles {
+		t.Fatalf("%d names for %d files", len(SourceFileNames), SourceFiles)
 	}
-	s := NewMemoryStore("HAPPYHRS", "FIFTYOFF")
-	for code, want := range map[string]bool{"HAPPYHRS": true, "FIFTYOFF": true, "happyhrs": false, "SUPER100": false} {
-		if ok, err := s.Has(ctx, code); ok != want || err != nil {
-			t.Errorf("Has(%q) = %v, %v; want %v", code, ok, err, want)
+	seen := map[string]bool{}
+	for _, n := range SourceFileNames {
+		if n == "" || seen[n] {
+			t.Errorf("bad or duplicate file name %q", n)
 		}
+		seen[n] = true
 	}
 }

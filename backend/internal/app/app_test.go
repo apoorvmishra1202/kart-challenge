@@ -17,9 +17,9 @@ func TestNew(t *testing.T) {
 		wantErr  bool
 		wantJSON bool
 	}{
-		{"development uses text logs", config.Config{Env: "development", HTTPAddr: ":8080", LogLevel: "info", APIKey: "k"}, false, false},
-		{"production uses JSON logs", config.Config{Env: "production", HTTPAddr: ":8080", LogLevel: "info", APIKey: "k"}, false, true},
-		{"invalid config is rejected", config.Config{Env: "nope", HTTPAddr: ":8080", LogLevel: "info", APIKey: "k"}, true, false},
+		{"development uses text logs", config.Config{Env: "development", HTTPAddr: ":8080", LogLevel: "info", APIKey: "k", DatabaseURL: "postgres://x", DataDir: "./data", ImportMinFiles: 2}, false, false},
+		{"production uses JSON logs", config.Config{Env: "production", HTTPAddr: ":8080", LogLevel: "info", APIKey: "k", DatabaseURL: "postgres://x", DataDir: "./data", ImportMinFiles: 2}, false, true},
+		{"invalid config is rejected", config.Config{Env: "nope", HTTPAddr: ":8080", LogLevel: "info", APIKey: "k", DatabaseURL: "postgres://x", DataDir: "./data", ImportMinFiles: 2}, true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

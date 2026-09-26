@@ -15,12 +15,10 @@ type ProductLookup interface {
 }
 
 // CouponValidator checks coupon codes; *coupon.Service implements it.
-// Validate returns nil for a valid code. An error whose InvalidCoupon method
-// reports true means the code was rejected; any other error is a failure of
-// the validator itself. (order can't import coupon, so it matches on that
-// behavior instead of on coupon.ErrInvalid.)
+// Validate reports whether code is valid; a non-nil error means the check
+// itself failed.
 type CouponValidator interface {
-	Validate(ctx context.Context, code string) error
+	Validate(ctx context.Context, code string) (bool, error)
 }
 
 // Store persists placed orders.
@@ -58,12 +56,12 @@ func (s *Service) Place(ctx context.Context, items []Item, couponCode string) (O
 	}
 
 	if couponCode != "" {
-		if err := s.coupons.Validate(ctx, couponCode); err != nil {
-			var rejected interface{ InvalidCoupon() bool }
-			if errors.As(err, &rejected) && rejected.InvalidCoupon() {
-				return Order{}, fmt.Errorf("%w: %q", ErrInvalidCoupon, couponCode)
-			}
+		ok, err := s.coupons.Validate(ctx, couponCode)
+		if err != nil {
 			return Order{}, fmt.Errorf("validate coupon: %w", err)
+		}
+		if !ok {
+			return Order{}, fmt.Errorf("%w: %q", ErrInvalidCoupon, couponCode)
 		}
 	}
 

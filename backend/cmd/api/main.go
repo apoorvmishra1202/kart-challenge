@@ -32,7 +32,11 @@ func main() {
 }
 
 func run() error {
-	a, err := app.New(config.Load())
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	a, err := app.New(cfg)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}

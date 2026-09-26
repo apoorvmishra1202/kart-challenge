@@ -5,14 +5,9 @@
 package coupon
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
 )
-
-// ErrInvalid means a coupon code was rejected: malformed or not a known
-// valid code.
-var ErrInvalid = errors.New("invalid coupon")
 
 const (
 	MinLength = 8
@@ -24,6 +19,10 @@ const (
 	// SourceFiles is the number of coupon files, the upper bound for min-files.
 	SourceFiles = 3
 )
+
+// SourceFileNames are the coupon files the importer reads from DATA_DIR. An
+// array (not a slice) so callers get a copy and can't change it.
+var SourceFileNames = [SourceFiles]string{"couponbase1.gz", "couponbase2.gz", "couponbase3.gz"}
 
 // IsWellFormed reports whether code satisfies the length rule.
 func IsWellFormed(code string) bool {

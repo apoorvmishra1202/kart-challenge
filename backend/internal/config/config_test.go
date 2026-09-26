@@ -6,36 +6,61 @@ import (
 	"testing"
 )
 
+var envKeys = []string{
+	"APP_ENV", "HTTP_ADDR", "LOG_LEVEL", "API_KEY", "DATABASE_URL", "DATA_DIR", "IMPORT_MIN_FILES",
+}
+
+const testDB = "postgres://shop:shop@localhost:5432/shop?sslmode=disable"
+
 func TestLoad(t *testing.T) {
+	defaults := Config{
+		Env: "development", HTTPAddr: ":8080", LogLevel: "info", APIKey: "apitest",
+		DataDir: "./data", ImportMinFiles: 2,
+	}
 	tests := []struct {
-		name string
-		env  map[string]string
-		want Config
+		name    string
+		env     map[string]string
+		want    Config
+		wantErr string
 	}{
-		{
-			name: "defaults",
-			env:  map[string]string{},
-			want: Config{Env: "development", HTTPAddr: ":8080", LogLevel: "info", APIKey: "apitest"},
-		},
+		{name: "defaults", env: map[string]string{}, want: defaults},
 		{
 			name: "all set",
 			env: map[string]string{
 				"APP_ENV": "production", "HTTP_ADDR": "127.0.0.1:9000", "LOG_LEVEL": "debug", "API_KEY": "s3cret",
+				"DATABASE_URL": testDB, "DATA_DIR": "/data", "IMPORT_MIN_FILES": "3",
 			},
-			want: Config{Env: "production", HTTPAddr: "127.0.0.1:9000", LogLevel: "debug", APIKey: "s3cret"},
+			want: Config{
+				Env: "production", HTTPAddr: "127.0.0.1:9000", LogLevel: "debug", APIKey: "s3cret",
+				DatabaseURL: testDB, DataDir: "/data", ImportMinFiles: 3,
+			},
 		},
 		{
 			name: "empty values fall back to defaults",
-			env:  map[string]string{"APP_ENV": "", "HTTP_ADDR": "", "LOG_LEVEL": "", "API_KEY": ""},
-			want: Config{Env: "development", HTTPAddr: ":8080", LogLevel: "info", APIKey: "apitest"},
+			env: map[string]string{
+				"APP_ENV": "", "HTTP_ADDR": "", "LOG_LEVEL": "", "API_KEY": "", "DATA_DIR": "", "IMPORT_MIN_FILES": "",
+			},
+			want: defaults,
 		},
+		{name: "unparsable IMPORT_MIN_FILES", env: map[string]string{"IMPORT_MIN_FILES": "two"}, wantErr: "IMPORT_MIN_FILES"},
+		{name: "IMPORT_MIN_FILES out of range", env: map[string]string{"IMPORT_MIN_FILES": "4"}, wantErr: "IMPORT_MIN_FILES"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			for _, k := range []string{"APP_ENV", "HTTP_ADDR", "LOG_LEVEL", "API_KEY"} {
+			for _, k := range envKeys {
 				t.Setenv(k, tt.env[k])
 			}
-			if got := Load(); got != tt.want {
+			got, err := Load()
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("Load() err = %v, want error containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
 				t.Errorf("Load() = %+v, want %+v", got, tt.want)
 			}
 		})
@@ -43,7 +68,10 @@ func TestLoad(t *testing.T) {
 }
 
 func TestValidate(t *testing.T) {
-	valid := Config{Env: "development", HTTPAddr: ":8080", LogLevel: "info", APIKey: "apitest"}
+	valid := Config{
+		Env: "development", HTTPAddr: ":8080", LogLevel: "info", APIKey: "apitest",
+		DatabaseURL: testDB, DataDir: "./data", ImportMinFiles: 2,
+	}
 	tests := []struct {
 		name    string
 		mutate  func(*Config)
@@ -55,6 +83,7 @@ func TestValidate(t *testing.T) {
 		{"host and port", func(c *Config) { c.HTTPAddr = "0.0.0.0:80" }, ""},
 		{"port 0 (random)", func(c *Config) { c.HTTPAddr = ":0" }, ""},
 		{"each log level", func(c *Config) { c.LogLevel = "warn" }, ""},
+		{"min files 1 and 3", func(c *Config) { c.ImportMinFiles = 3 }, ""},
 
 		{"unknown env", func(c *Config) { c.Env = "staging" }, "APP_ENV"},
 		{"env wrong case", func(c *Config) { c.Env = "Production" }, "APP_ENV"},
@@ -65,6 +94,10 @@ func TestValidate(t *testing.T) {
 		{"log level with offset", func(c *Config) { c.LogLevel = "info+2" }, "LOG_LEVEL"},
 		{"empty api key", func(c *Config) { c.APIKey = "" }, "API_KEY must not be empty"},
 		{"default key in production", func(c *Config) { c.Env = "production" }, "API_KEY must be changed"},
+		{"missing database url", func(c *Config) { c.DatabaseURL = "" }, "DATABASE_URL is required"},
+		{"empty data dir", func(c *Config) { c.DataDir = "" }, "DATA_DIR"},
+		{"min files 0", func(c *Config) { c.ImportMinFiles = 0 }, "IMPORT_MIN_FILES"},
+		{"min files 4", func(c *Config) { c.ImportMinFiles = 4 }, "IMPORT_MIN_FILES"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -82,11 +115,11 @@ func TestValidate(t *testing.T) {
 }
 
 func TestValidateReportsAllErrors(t *testing.T) {
-	err := Config{Env: "x", HTTPAddr: "x", LogLevel: "x", APIKey: ""}.Validate()
+	err := Config{Env: "x", HTTPAddr: "x", LogLevel: "x"}.Validate()
 	if err == nil {
 		t.Fatal("want error")
 	}
-	for _, want := range []string{"APP_ENV", "HTTP_ADDR", "LOG_LEVEL", "API_KEY"} {
+	for _, want := range []string{"APP_ENV", "HTTP_ADDR", "LOG_LEVEL", "API_KEY", "DATABASE_URL", "DATA_DIR", "IMPORT_MIN_FILES"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %s", err, want)
 		}

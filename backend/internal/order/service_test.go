@@ -28,27 +28,18 @@ func (f *fakeProducts) Get(_ context.Context, id string) (product.Product, error
 	return p, nil
 }
 
-// rejectedCoupon mimics coupon's rejection error: it reports InvalidCoupon().
-type rejectedCoupon struct{}
-
-func (rejectedCoupon) Error() string       { return "invalid coupon" }
-func (rejectedCoupon) InvalidCoupon() bool { return true }
-
 type fakeCoupons struct {
 	valid map[string]bool
 	err   error // returned instead of a verdict (validator failure)
 	calls []string
 }
 
-func (f *fakeCoupons) Validate(_ context.Context, code string) error {
+func (f *fakeCoupons) Validate(_ context.Context, code string) (bool, error) {
 	f.calls = append(f.calls, code)
 	if f.err != nil {
-		return f.err
+		return false, f.err
 	}
-	if !f.valid[code] {
-		return fmt.Errorf("validate: %w", rejectedCoupon{}) // wrapped, like the real one
-	}
-	return nil
+	return f.valid[code], nil
 }
 
 type fakeStore struct {

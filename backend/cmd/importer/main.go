@@ -9,11 +9,10 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"shop/internal/config"
 	"shop/internal/coupon"
 	"shop/internal/database"
 )
-
-var sourceFiles = []string{"couponbase1.gz", "couponbase2.gz", "couponbase3.gz"}
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -24,36 +23,31 @@ func main() {
 }
 
 func run(log *slog.Logger) error {
-	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		return fmt.Errorf("DATABASE_URL is required")
-	}
-	dataDir := os.Getenv("DATA_DIR")
-	if dataDir == "" {
-		dataDir = "./data"
-	}
-
-	files := make([]string, len(sourceFiles))
-	for i, name := range sourceFiles {
-		files[i] = filepath.Join(dataDir, name)
-		if _, err := os.Stat(files[i]); err != nil {
-			return fmt.Errorf("coupon file %s not found in DATA_DIR %q: %w", name, dataDir, err)
-		}
-	}
-
-	minFiles, err := coupon.ParseMinFiles(os.Getenv("IMPORT_MIN_FILES"))
+	cfg, err := config.Load()
 	if err != nil {
-		return err
+		return fmt.Errorf("config: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+
+	files := make([]string, 0, len(coupon.SourceFileNames))
+	for _, name := range coupon.SourceFileNames {
+		path := filepath.Join(cfg.DataDir, name)
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("coupon file %s not found in DATA_DIR %q: %w", name, cfg.DataDir, err)
+		}
+		files = append(files, path)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := database.NewPool(ctx, databaseURL)
+	pool, err := database.NewPool(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
 
-	return coupon.NewImporter(pool, log, minFiles).Run(ctx, files)
+	return coupon.NewImporter(pool, log, cfg.ImportMinFiles).Run(ctx, files)
 }

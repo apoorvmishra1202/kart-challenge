@@ -3,6 +3,7 @@
 package app
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -41,9 +42,7 @@ func newApp(cfg config.Config, out io.Writer) (*App, error) {
 	logger := slog.New(h).With("env", cfg.Env)
 
 	productSvc := product.NewService(product.NewMemoryStore(product.SeedProducts()))
-	// Empty store: every coupon is rejected until the API is wired to
-	// coupon.PostgresStore (valid_codes, filled by cmd/importer).
-	couponSvc := coupon.NewService(coupon.NewMemoryStore())
+	couponSvc := coupon.NewService(noCoupons{})
 	orderSvc := order.NewService(order.NewMemoryStore(), productSvc, couponSvc)
 
 	productHandler := product.NewHandler(productSvc)
@@ -59,3 +58,9 @@ func newApp(cfg config.Config, out io.Writer) (*App, error) {
 		),
 	}, nil
 }
+
+// noCoupons rejects every code. Temporary: replaced by coupon.NewStore(pool)
+// once the API opens a database pool.
+type noCoupons struct{}
+
+func (noCoupons) Exists(context.Context, string) (bool, error) { return false, nil }
