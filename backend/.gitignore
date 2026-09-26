@@ -1,0 +1,6 @@
+.env
+# Real coupon files (~1 GB each), kept local only; small samples live in testdata/
+data/
+bin/
+*.db
+.DS_Store

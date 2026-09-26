@@ -1,0 +1,1041 @@
+# Code Log
+
+A running record of what was built and changed, and why, so that final
+documentation can be written from here instead of from chat history.
+Add a new entry at the bottom after every change.
+
+Entry format: date, title, **What**, **Why**, **Files**, plus **Results** and
+**Notes** when relevant.
+
+---
+
+## 2026-09-26: Coupon importer, first version (superseded)
+
+**What:** First pass at loading the three coupon files into Postgres through
+Docker Compose, written before a detailed spec existed.
+- Streamed each `.gz` file into Postgres with `COPY`, loading the files
+  concurrently.
+- Used a `coupon_files` table (auto-generated IDs) and a logged
+  `coupon_codes` table with an index on `code`.
+
+**Why superseded:** A detailed spec arrived afterwards. It differed on the
+module name, table names and types, idempotency rules, length filtering,
+errgroup, and tests. See the next entry.
+
+**Kept from this version:** Dockerfile, `.dockerignore` (keeps the ~2 GB of
+data out of the build), and pgx pinned to v5.7.5 (the latest release needs
+Go 1.25; local Go is 1.24).
+
+---
+
+## 2026-09-26: Coupon importer rewritten to the spec
+
+**What**
+- Module renamed to `shop`. Dependencies: pgx v5.7.5 (pgxpool) and
+  `golang.org/x/sync` v0.13.0 (errgroup), both compatible with Go 1.24.
+- **Data layout:** the real ~1 GB files moved to `data/` (git-ignored). Tiny
+  sample files with the same names live in `testdata/` and are committed.
+- **Schema** (also in `migrations/001_create_coupon_tables.sql`):
+  - `coupon_codes (code TEXT, file_id SMALLINT)`, created **UNLOGGED**.
+  - `import_status (name PK, row_count, completed_at)`.
+  - `idx_coupon_code_file ON coupon_codes (code, file_id)`, created only after
+    loading.
+- **`internal/ingest/reader.go`:** a generic streaming `pgx.CopyFromSource`
+  over gzip. It uses `bufio.Reader.ReadLine`, skips lines longer than the
+  64 KB buffer, trims whitespace, and takes a caller-supplied `keep` filter.
+  It has no coupon rules.
+- **`internal/coupon`:**
+  - `coupon.go`: `MinLength=8`, `MaxLength=10`, `MinFiles=2`, `IsWellFormed`.
+  - `import.go`: `Importer.Run`. Steps: create schema → skip if done → clean
+    up any partial run → load 3 files in parallel (file_id 1, 2, 3) → build
+    the index with `maintenance_work_mem=512MB` → `ANALYZE` → write the status
+    row.
+  - `store.go`: `CountFiles` runs
+    `SELECT COUNT(DISTINCT file_id) FROM coupon_codes WHERE code = $1`.
+  - `service.go`: `Validate` rejects malformed codes without querying the
+    database; a code is valid when `count >= MinFiles`.
+- **`internal/database`:** a pgx pool with MaxConns 4 and a startup Ping.
+- **`internal/config`:** reads `DATABASE_URL` (required) and `DATA_DIR`
+  (default `./data`).
+- **`cmd/importer`:** checks that all 3 files exist before connecting, handles
+  SIGINT/SIGTERM, and exits with code 1 on error.
+- **Docker Compose:** `db` (Postgres 16, `shm_size: 1g`, pg_isready
+  healthcheck) → `importer` (mounts `./data:/data:ro`) → `api` (waits for the
+  importer with `service_completed_successfully`).
+- **Tests:** reader filtering and trimming, over-long lines, non-gzip input;
+  `IsWellFormed` table; service tests with a fake store (counts 0–3,
+  malformed codes, store errors).
+- README section added covering the import design and why rule 2 is checked
+  at query time.
+
+**Why (key decisions)**
+- **Rule 2 is checked at query time.** Precomputing codes shared across files
+  would need a large aggregate over ~300M rows. Storing raw `(code, file_id)`
+  rows keeps the load a plain `COPY`, lookups are index-only, and changing
+  `MinFiles` needs no re-import.
+- **UNLOGGED table.** The data can always be rebuilt from the files, so it
+  skips the write-ahead log. Because Postgres empties unlogged tables after a
+  crash, the "already imported" check needs both the status row *and* a
+  non-empty table.
+- **Index after load.** Building the index once is much faster than
+  maintaining it during a bulk `COPY`.
+- **Length filter applied during load.** Codes that can never be valid are
+  never stored.
+
+**Files:** `go.mod`, `go.sum`, `cmd/importer/main.go`, `internal/config/`,
+`internal/database/`, `internal/ingest/`, `internal/coupon/`, `migrations/`,
+`Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.gitignore`,
+`README.md`, `testdata/*.gz`.
+
+**Results:** `go build`, `go vet` and `go test` all pass.
+
+---
+
+## 2026-09-26: Sample data import verified
+
+**What:** Ran the importer locally against `testdata/`, using the compose
+database.
+
+```sh
+docker compose up -d db
+DATABASE_URL=postgres://shop:shop@localhost:5432/shop?sslmode=disable DATA_DIR=./testdata go run ./cmd/importer
+```
+
+**Results**
+- 12 rows (4 per file). Short and over-long codes were dropped; `\r` and
+  surrounding spaces were trimmed.
+- Valid (in 2 or more files): `BIRTHDAY10`, `FIFTYOFF`, `HAPPYHRS`,
+  `SUPER100`.
+- Invalid (in 1 file): `ONLYFILE1`, `ONLYFILE2`, `ONLYFILE3`.
+- The query plan showed a full table scan, which is expected for a 12-row
+  table.
+
+---
+
+## 2026-09-26: Full data import verified
+
+**What:** Ran the full import through Docker.
+
+```sh
+docker compose down -v
+docker compose up --build importer
+```
+
+**Results**
+
+| Step | Rows | Duration |
+|---|---|---|
+| couponbase1.gz | 107,260,777 | 2m18s |
+| couponbase2.gz | 107,260,776 | 2m18s |
+| couponbase3.gz | 98,566,152 | 2m16s |
+| Index build | – | 12m57s |
+| **Total** | **313,087,705** | **15m15s** |
+
+- The three files load in parallel, so the load phase takes about 2m18s in
+  total.
+- Storage: table 13 GB, index 9.4 GB (about 22 GB of Docker volume).
+- A validation lookup is an **index-only scan** on `idx_coupon_code_file`:
+  0 table reads, about 1.5 ms with a cold cache.
+- Sample lookups (number of files the code appears in):
+  - `HAPPYHRS` 2, `FIFTYOFF` 3, `BIRTHDAY` 3, `OVER9000` 3: valid.
+  - `SUPER100` 1: invalid.
+  - `BUYGETONE` 0: not found.
+- Re-running `docker compose up importer` skips the load. Only
+  `docker compose down -v` forces a full re-import.
+
+**Notes**
+- File 3 has fewer rows because the file has fewer lines, not because of
+  filtering: 8 of its codes are 8 characters and 98,566,144 are 10 characters,
+  so nothing was dropped.
+- All codes in file 1 are 8 characters long.
+
+---
+
+## 2026-09-26: Importer v1 committed and pushed
+
+Commit `ff0514b feat(backend): coupon code importer v1` on `dev`, containing
+everything above. `.DS_Store` was added to `backend/.gitignore`.
+
+---
+
+## 2026-09-26: Importer optimization
+
+**What**
+- **Byte-order collation:** the column is now `code TEXT COLLATE "C" NOT NULL`,
+  in both the importer schema and `migrations/001_create_coupon_tables.sql`.
+  - On startup the importer checks the collation of `coupon_codes.code`
+    (`pg_attribute` joined with `pg_collation`). If the table exists without
+    `"C"`, it logs a warning, drops the table, and deletes the `import_status`
+    row, so an old v1 volume is rebuilt automatically.
+- **Faster index build:** on the single index connection it runs
+  `SET maintenance_work_mem` and `SET max_parallel_maintenance_workers`, then
+  `RESET`s both afterwards.
+  - Values come from env `IMPORT_MAINTENANCE_WORK_MEM` (default `1GB`) and
+    `IMPORT_PARALLEL_WORKERS` (default `4`), also set in `docker-compose.yml`.
+  - Both are interpolated into SQL, so `coupon.ParseIndexOptions` validates
+    them first. Memory must match `^[0-9]+(kB|MB|GB)$`; workers must be an
+    integer from 0 to 16. The importer fails before connecting otherwise.
+- **Index-only scans:** `ANALYZE` was replaced with `VACUUM (ANALYZE)` after
+  the index build, as a plain `Exec` since VACUUM can't run in a transaction.
+- **Phase timings:** the importer logs load (per file and total), index build,
+  vacuum/analyze, and total durations, then table and index sizes.
+  - `import_status` gained `load_ms`, `index_ms` and `vacuum_ms` columns via
+    `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
+- `NewImporter` now takes an `IndexOptions` argument.
+
+**Why**
+- **"C" collation:** codes are ASCII uppercase letters and digits, so byte
+  order sorts them correctly. The default linguistic collation makes every
+  comparison in the index sort, and every lookup, more expensive.
+- **More memory and parallel workers:** the index build was 85% of import
+  time (12m57s of 15m15s).
+- **VACUUM:** it sets the visibility map. Without it, index-only scans may
+  still fetch table rows until autovacuum happens to run.
+
+**Files:** `internal/coupon/import.go`, `internal/coupon/import_test.go` (new),
+`cmd/importer/main.go`, `migrations/001_create_coupon_tables.sql`,
+`docker-compose.yml`.
+
+**Results (throwaway Postgres on :5433, sample data)**
+- `go build`, `go vet` and `go test` pass. The new table test covers valid
+  values, out-of-range workers, missing or lowercase units, and SQL-injection
+  strings.
+- **Old schema detected:** with a v1 table (default collation) and status row
+  already present, the importer logged `collation=default`, dropped the table,
+  and re-imported 12 rows. The old row was gone.
+- The rebuilt column reports `collation_name = C`. The status row has
+  `load_ms`, `index_ms` and `vacuum_ms` filled in.
+- A second run skipped the import.
+- A bad `IMPORT_MAINTENANCE_WORK_MEM` or `IMPORT_PARALLEL_WORKERS=99` exits 1
+  with a clear message.
+- A lookup is an index-only scan with `Heap Fetches: 0`.
+- Full-data results are in the next entry.
+
+**Notes:** Migration 001 was edited in place rather than adding a new
+migration file. There is no migration runner; the importer creates the schema
+itself.
+
+---
+
+## 2026-09-26: Optimized full import verified
+
+**What:** Ran `docker compose down -v`, then `docker compose up --build`.
+- The first attempt was cut off when Docker Desktop was quit from its app
+  during the index build (the Docker log shows `POST /app/quit`, a clean
+  shutdown, not a crash). The importer exited with code 1.
+- It was resumed with `docker compose up importer` on the same volume. There
+  was no status row, so the importer truncated the partial table and reloaded
+  it. The final count is exactly 313,087,705, so partial-run cleanup works on
+  real data.
+
+**Results (v1 → optimized)**
+
+| Phase | v1 | Optimized |
+|---|---|---|
+| Load (3 files in parallel) | 2m18s | 59s |
+| Index build | 12m57s | 6m06s |
+| VACUUM (ANALYZE) | – (plain ANALYZE, not timed) | 1m04s |
+| **Total** | **15m15s** | **8m10s** |
+| Table size | 13 GB | 13 GB |
+| Index size | 9.4 GB | 9.4 GB (9418 MB) |
+| Cold lookup (index-only scan) | 1.45 ms | 2.9 ms, `Heap Fetches: 0` |
+
+- `import_status`: `load_ms=58885`, `index_ms=366465`, `vacuum_ms=64148`.
+  The column's `collation_name` is `C`.
+- Lookups: `HAPPYHRS` 2, `FIFTYOFF` 3, `SUPER100` 1, the same as v1.
+
+**Notes**
+- **Index build (2.1× faster)** is the direct result of the "C" collation,
+  1 GB `maintenance_work_mem`, and 4 parallel workers.
+- **Load time** varied from run to run (2m18s in v1, 1m33s on the interrupted
+  run, 59s here) even though the load code barely changed. The likely cause is
+  the OS file cache and less competition for the machine, so it isn't claimed
+  as an optimization win.
+- **Cold lookup timings** of 1–3 ms are single cold reads of 4–6 buffers and
+  are noise at this scale. What matters is that the plan is an index-only scan
+  with 0 heap fetches.
+- **Disk and laptop:** Docker's disk file is about 31 GB and the Mac had 24 GB
+  free. Loading and indexing make the laptop sluggish, so after measuring we
+  stop the containers (`docker compose stop`) and quit Docker Desktop. The
+  data stays in the `pgdata` volume.
+
+---
+
+## 2026-09-26: Optimization committed and pushed
+
+Commit `5e3c737 perf(backend): speed up coupon import index build` on `dev`.
+
+---
+
+## 2026-09-26: Experimental "valid" import mode
+
+**What**
+- **Mode switch:** new env `IMPORT_MODE` accepts `all` (default, unchanged
+  behavior) or `valid`. It is passed through `docker-compose.yml` as
+  `${IMPORT_MODE:-all}`, and `coupon.ParseMode` rejects any other value.
+- **`import_status.mode`:** new `TEXT` column, added with `ADD COLUMN IF NOT
+  EXISTS`.
+  - Each mode has its own status row: `coupon_codes`/`all` and
+    `valid_codes`/`valid`. The skip check matches both name and mode.
+  - A `NULL` mode (rows written before this column existed) is treated as
+    `all`, so the existing full import is still skipped.
+- **"valid" mode** (`internal/coupon/import_valid.go`):
+  1. Reads the 3 files concurrently (errgroup) with the ingest reader.
+  2. Encodes each code of valid length to a `uint64`, failing on any
+     character outside `[A-Z0-9]` with the file, line number and line.
+  3. Runs `slices.Sort` and `slices.Compact` on each file's slice.
+  4. Merges the three slices, keeping values found in at least `MinFiles`
+     files, then frees the per-file slices.
+  5. In one transaction: `TRUNCATE valid_codes`, `COPY` the decoded codes,
+     and upsert the status row.
+- **Encoding** (`internal/coupon/codec.go`): base 37, with '0'-'9' → 1-10
+  and 'A'-'Z' → 11-36. No digit is 0, so codes of different lengths never
+  collide, and 37^10 < 2^64. Within one length, numeric order equals byte
+  order.
+  - `MergeValid` also skips repeated values within a file, so duplicates
+    count once even if a caller skips deduplication.
+- **Slice sizing:** each per-file slice is sized up front from the gzip
+  trailer (uncompressed size ÷ 9 is an upper bound on codes). This avoids
+  append temporarily doubling a ~1 GB array while it grows.
+- **Ingest reader:** added `Scan`, `Bytes` and `LineNumber`, which read
+  without allocating. `Next` is now built on `Scan`, with unchanged behavior.
+- **Logged measurements:**
+  - Per file: lines, codes kept, unique codes, read+encode time, sort+dedupe
+    time.
+  - Overall: merge time, valid count, COPY time, total time.
+  - Peak `HeapAlloc` and `Sys` from sampling `runtime.MemStats` every 200 ms.
+  - Sizes of `valid_codes` and `valid_codes_pkey`.
+  - `load_ms` stores the Go preprocessing time. `index_ms` and `vacuum_ms` are
+    NULL in this mode.
+- **Other:** `logSizes` became `logRelationSizes(table, index)`, and migration
+  001 gained the `mode` column and the `valid_codes` table.
+
+**Why:** An experiment to compare against "all" mode. It stores a small table
+of valid codes instead of 313M rows plus a 9.4 GB index, at the cost of RAM
+at import time and of fixing `MinFiles` at import time.
+
+**Files:** `internal/coupon/codec.go`, `codec_test.go`, `import_valid.go`,
+`import_valid_test.go` (all new); `internal/coupon/import.go`,
+`internal/ingest/reader.go`, `reader_test.go`, `cmd/importer/main.go`,
+`docker-compose.yml`, `migrations/001_create_coupon_tables.sql`.
+
+**Results**
+- `go build`, `go vet` and `go test -race` pass.
+- New tests cover:
+  - Encode/decode round trips for lengths 8, 9 and 10, with no collisions
+    across lengths and order matching byte order.
+  - Rejection of wrong lengths and bad characters.
+  - Merge with codes in 1, 2 and 3 files, and duplicates within a file
+    counting once.
+  - Reading a file with trimming and dedupe, and failing on a bad character
+    with its line number.
+  - `ParseMode`, and line numbers from `Scan`.
+- **Throwaway Postgres (:5433), sample data:**
+  - `valid_codes` = `BIRTHDAY10`, `FIFTYOFF`, `HAPPYHRS`, `SUPER100`, matching
+    "all" mode.
+  - A second run of each mode skipped, including an "all" status row with
+    `mode = NULL`.
+  - `coupon_codes` was untouched, and `IMPORT_MODE=both` exits 1.
+- **Real files scanned with awk:** 0 codes of valid length contain
+  characters outside `[A-Z0-9]`.
+- **Environment:** Docker Desktop's VM has 3.8 GiB of memory; the Mac has
+  8 GiB.
+
+**Notes:** "valid" mode needs roughly 3-5 GB of RAM. That is more than the
+3.8 GiB Docker VM, which Postgres also shares, so on this laptop run the
+importer natively (`go run`) against the compose database, or raise Docker's
+memory limit to 6 GB or more.
+
+---
+
+## 2026-09-26: "valid" mode on full data, compared with "all"
+
+**What:** Ran the importer natively on the Mac, since Docker's VM has only
+3.8 GiB, against the compose database that already held the "all" import.
+
+```sh
+docker compose up -d db
+IMPORT_MODE=valid DATABASE_URL='postgres://shop:shop@localhost:5432/shop?sslmode=disable' DATA_DIR=./data go run ./cmd/importer
+```
+
+(The first attempt failed because Docker Desktop was not running, and
+because zsh treated a pasted `# comment` as arguments. Don't put inline
+comments in commands meant to be pasted.)
+
+**Per file (read and sort run concurrently across files)**
+
+| File | Lines | Unique | Duplicates in file | Read+encode | Sort+dedupe |
+|---|---|---|---|---|---|
+| couponbase1.gz | 107,260,777 | 107,258,700 | 2,077 | 15.3s | 12.5s |
+| couponbase2.gz | 107,260,776 | 107,260,726 | 50 | 16.5s | 12.1s |
+| couponbase3.gz | 98,566,152 | 98,566,151 | 1 | 16.4s | 11.4s |
+
+**"all" vs "valid"**
+
+| | all (optimized) | valid |
+|---|---|---|
+| Total import time | 8m10s | **32s** |
+| Stages | load 59s, index 6m06s, vacuum 1m04s | preprocess 32.0s (incl. merge 3.2s), COPY 29 ms |
+| Rows stored | 313,087,705 | **8** |
+| Table + index | 13 GB + 9.4 GB | 8 kB + 16 kB |
+| Peak importer memory | small (streams rows) | 2,653 MiB heap; 2.52 GB peak footprint (`/usr/bin/time -l`) |
+| Lookup | index-only scan, ~1.5-3 ms cold | index-only scan, 0.25 ms (warm) |
+| Changing `MinFiles` | no re-import | needs re-import |
+
+**Correctness check:** the full-table query in "all" mode
+(`GROUP BY code HAVING COUNT(DISTINCT file_id) >= 2`, 1m27s) returns exactly
+the same 8 codes as `valid_codes`: `BIRTHDAY`, `BUYGETON`, `FIFTYOFF`,
+`FREEZAAA`, `GNULINUX`, `HAPPYHRS`, `OVER9000`, `SIXTYOFF`.
+- `HAPPYHRS` appears in 2 files; the other 7 appear in all 3.
+- All 8 are 8 characters long. `SUPER100` is in only 1 file, so it's invalid.
+
+**Notes**
+- `coupon_codes` was untouched (still 313,087,705 rows). Its status row
+  (`mode` NULL, treated as "all") survived, so the two modes coexist.
+- The real data has very little overlap between files. File 1 is all
+  8-character codes and file 3 is almost all 10-character codes, so only 8
+  codes pass rule 2.
+- Peak memory came in under the 3-5 GB estimate, because the slices are
+  sized up front from the gzip trailer and never grow.
+- The `valid_codes` lookup showed `Heap Fetches: 1` because the table hasn't
+  been vacuumed yet, which doesn't matter for 8 rows.
+- The design decision is still open. "valid" is far cheaper in time and
+  disk; "all" keeps `MinFiles` changeable without a re-import.
+
+---
+
+## 2026-09-26: Experiment committed
+
+Commit `f1a2d1f feat(backend): experimental "valid" import mode` on `dev`.
+
+---
+
+## 2026-09-26: "valid" mode becomes the design; "all" mode removed
+
+**What**
+- **Importer** (`internal/coupon/import.go`, rewritten):
+  - Always runs the encode → sort → merge pipeline into `valid_codes`.
+  - Removed: `IMPORT_MODE`, the per-row `COPY` into `coupon_codes`, the index
+    build, VACUUM, `IMPORT_MAINTENANCE_WORK_MEM`, `IMPORT_PARALLEL_WORKERS`,
+    `IndexOptions`, `Mode`, and the collation-migration code.
+    `import_valid.go` was merged into `import.go`.
+- **`IMPORT_MIN_FILES`** (default 2, must be 1-3): parsed by
+  `coupon.ParseMinFiles` and stored in `import_status.min_files`.
+  - A run is skipped only if a completed import used the same `min_files`.
+  - A different value, or an older row with `min_files` NULL, re-imports
+    automatically.
+  - `MinFiles` became `DefaultMinFiles`; `SourceFiles = 3` is the upper bound.
+- **Legacy cleanup:** on startup, if `coupon_codes` exists, the importer drops
+  it (`DROP TABLE IF EXISTS`), deletes its status row, and logs
+  "dropped legacy coupon_codes table to reclaim disk space".
+  - `import_status` loses `index_ms`, `vacuum_ms` and `mode` (via
+    `DROP COLUMN IF EXISTS`) and gains `min_files`.
+- **Migrations:** added `002_valid_codes_only.sql` (drops `coupon_codes` and
+  its status row, drops the unused status columns, adds `min_files`).
+  - `001` was left unchanged: it's already pushed and there's no migration
+    runner, so a new migration is cleaner than rewriting history.
+- **Lookup:** `Store.CountFiles` became `Store.Exists`, running
+  `SELECT EXISTS (SELECT 1 FROM valid_codes WHERE code = $1)`.
+  - `Service.Validate` still rejects malformed codes before querying.
+  - The `FileCounter` interface became `CodeStore`.
+- **Compose:** removed `shm_size` (only parallel index builds needed it) and
+  the three unused importer env vars; added `IMPORT_MIN_FILES`.
+- **README:** rewritten with requirements (Docker memory >= 4 GB), env vars,
+  the final design, the measured comparison table, and why this design was
+  chosen.
+
+**Why:** On the full data it took 32s instead of 8m10s and uses 8 kB + 16 kB
+instead of 13 GB + 9.4 GB, with identical results. The only advantage of the
+old design (changing the rule without a re-import) is now covered by
+`IMPORT_MIN_FILES`, since a re-import takes about 32s.
+
+**Files:** `internal/coupon/{coupon,import,store,service}.go`,
+`internal/coupon/{coupon,codec,import}_test.go`, `cmd/importer/main.go`,
+`docker-compose.yml`, `migrations/002_valid_codes_only.sql` (new),
+`README.md`. Removed: `internal/coupon/import_valid.go`,
+`import_valid_test.go`.
+
+**Results**
+- `go build`, `go vet` and `go test -race` pass.
+- New tests: `ParseMinFiles` (accepts 1-3 and empty; rejects 0, 4, -1,
+  "two", " 2", "2.0"), `MergeValid` with `minFiles` 1, 2 and 3, and service
+  tests using a fake `Exists` store.
+- **End to end on a throwaway Postgres (:5433), sample data**, seeded with the
+  legacy layout (`coupon_codes` table, a status row with
+  `mode`/`index_ms`/`vacuum_ms`, and a stale `valid_codes` row):
+  1. Dropped `coupon_codes` and logged it; imported 4 valid codes and replaced
+     the stale one.
+  2. Same settings again: skipped.
+  3. `IMPORT_MIN_FILES=3`: 1 code. `=1`: 7 codes. Back to `2`: 4 codes.
+     Each change re-imported.
+  4. `IMPORT_MIN_FILES=4`: exits 1 with a clear error.
+  5. Final state: no `coupon_codes`, one status row with `min_files = 2`, and
+     `valid_codes` = `BIRTHDAY10`, `FIFTYOFF`, `HAPPYHRS`, `SUPER100`.
+- Not yet run on the real Docker volume, which still holds the ~22 GB
+  `coupon_codes` table.
+
+---
+
+## 2026-09-26: Final design verified on the full data in Docker
+
+**What:** Ran `docker compose down -v`, then
+`docker compose up --build importer`: a fresh volume, with the importer
+running inside Docker.
+
+**Results**
+
+| Step | Native (earlier run) | Docker |
+|---|---|---|
+| Read+encode per file | 15-16.5s | 21-24s |
+| Sort+dedupe per file | 11-12.5s | 19-22s |
+| Merge | 3.2s | 4.2s |
+| COPY | 29 ms | 67 ms |
+| **Total** | **32s** | **50.3s** |
+| Peak heap / Sys | 2,653 MiB / 2,667 MiB | 2,653 MiB / 2,666 MiB |
+
+- `import_status`: one row (`valid_codes`, 8 rows, `load_ms=50253`,
+  `min_files=2`). There's no `coupon_codes` table.
+- `valid_codes`: the same 8 codes as before. Database size is 7.6 MB, mostly
+  Postgres system catalogs, and the `pgdata` volume is 48 MB (it was about
+  22 GB).
+- Docker's disk file on the Mac shrank from 31 GB to 14 GB.
+- It fit in Docker Desktop's 3.8 GiB VM (peak ~2.6 GiB plus Postgres), but
+  with little headroom. The README keeps the 4 GB requirement.
+
+**Notes**
+- Docker is about 1.6× slower than running natively, in both reading and
+  sorting. The likely causes are the VM's CPU and memory overhead and reading
+  the bind-mounted `./data` files through the VM's file sharing.
+- The README now says about 50s in Docker and 32s natively.
+- The "dropped legacy coupon_codes" path wasn't exercised here, because the
+  volume was fresh. It was tested on the throwaway database.
+
+---
+
+## 2026-09-26: Shared HTTP plumbing (config, helpers, server)
+
+**What** (standard library only; no domain code yet)
+- **`internal/config`:** `Config{Env, HTTPAddr, LogLevel, APIKey}`.
+  - `Load()` reads `APP_ENV` (default `development`), `HTTP_ADDR` (`:8080`),
+    `LOG_LEVEL` (`info`) and `API_KEY` (`apitest`, the key from the OpenAPI
+    example).
+  - `Validate()` reports every problem at once: env must be
+    development/test/production, the address must be `host:port` with a port
+    of 0-65535, the log level must be debug/info/warn/error, the key must not
+    be empty, and the default key is rejected in production.
+  - `SlogLevel()` converts the level for the logger.
+- **`internal/httpx`:**
+  - `APIError{code,type,message}`, matching `ApiResponse` in the spec.
+  - `WriteJSON` and `WriteError`. `WriteError` turns any status below 400
+    into 500, so an error is never sent with a success code.
+  - Error type constants (`not_found`, `unauthorized`, ...).
+  - `DecodeJSON[T]` uses `MaxBytesReader` and `DisallowUnknownFields`. It
+    accepts `application/json` with any parameters (charset), and rejects
+    empty bodies and trailing data.
+  - Every `DecodeJSON` error is a `*RequestError{Status, Type, Message}`:
+    415 wrong media type, 413 too large, 400 malformed JSON, wrong field type,
+    unknown field, empty body or multiple values.
+- **`internal/httpapi`:**
+  - `RequestID` reuses a well-formed `X-Request-ID` (printable, 128 chars or
+    fewer) or generates 32 hex characters, and exposes it via
+    `RequestIDFrom(ctx)`.
+  - `Logger(*slog.Logger)` logs method, path, status, bytes, duration and
+    request ID (errors for 5xx).
+  - `Recover(*slog.Logger)` turns a panic into a 500 APIError and logs it
+    with its stack. It re-panics `http.ErrAbortHandler` and doesn't overwrite
+    a response already started.
+  - `APIKey(key)`: 401 when the `api_key` header is missing or empty, 403 when
+    it's wrong (constant-time comparison).
+  - `NewRouter(logger)`: `GET /healthz` returns `{"status":"ok"}`; other
+    methods on `/healthz` get a JSON 405 with `Allow: GET, HEAD`; any other
+    path gets a JSON 404. Middleware order: RequestID → Logger → Recover.
+- **`internal/app`:** `New(cfg)` validates the config and builds the logger
+  (JSON in production, text otherwise) and the router. It is the only place
+  that wires dependencies.
+- **`cmd/api`:**
+  - Opens the listener before serving, so a bad or busy address exits 1.
+  - Timeouts: ReadHeader 5s, Read 10s, Write 15s, Idle 60s.
+  - Graceful shutdown on SIGINT/SIGTERM with a 10s limit.
+  - Startup errors go to stderr with exit code 1.
+- **`cmd/importer`:** now reads `DATABASE_URL` and `DATA_DIR` itself, because
+  `config.Config` is the API's config. The importer's behavior is unchanged.
+
+**Why these choices**
+- **`Recover` takes a logger:** so panics are logged with their stack; the
+  task listed it without a signature.
+- **`Load` returns only `Config`:** defaults can't fail, and all checks live
+  in `Validate`.
+- **JSON 405 for wrong methods:** without it, a method-less catch-all would
+  have turned a wrong method into a 404.
+
+**Files:** `internal/config/config.go`, `internal/httpx/{request,response}.go`,
+`internal/httpapi/{middleware,router}.go`, `internal/app/app.go`,
+`cmd/api/main.go`, `cmd/importer/main.go`, plus tests: `config_test.go`,
+`request_test.go`, `response_test.go`, `middleware_test.go`,
+`router_test.go`, `app_test.go`.
+
+**Results**
+- `go build`, `go vet` and `go test -race` pass.
+- Table-driven tests:
+  - Config: `Load` defaults, set values and empty values; 15 `Validate`
+    cases; all errors reported together.
+  - `DecodeJSON`: 19 cases, including charset variants, 415, 413, syntax
+    errors, truncation, wrong types, unknown fields and trailing data.
+  - `APIKey`: 9 cases, including missing, empty, wrong, prefix, suffix, case,
+    and a header name in any case.
+  - Also `WriteError` (never 2xx or 3xx), router 200/404/405, `Recover`,
+    `RequestID`, the `Logger` fields, and `app.New`.
+- **Smoke test of the binary:**
+  - `/healthz` returns 200 with JSON and an `X-Request-Id`.
+  - An unknown route returns a JSON 404; `POST /healthz` a JSON 405.
+  - A busy port exits 1.
+  - SIGTERM logs "shutting down" then "server stopped".
+  - Bad config (`APP_ENV=prod`, `LOG_LEVEL=loud`) lists both errors and exits
+    1; production with the default key exits 1.
+- **Rules check:** no `fmt.Print` or `log.Fatal` outside `main`, no
+  utils/common/helpers packages, no new dependencies, and nothing changed
+  outside `backend/`.
+
+---
+
+## 2026-09-26: Product API
+
+**What** (`internal/product/`, standard library only)
+- **`product.go`:** `Product{ID, Name, Price int64 (cents), Category}` with
+  no JSON tags, and `ErrNotFound`.
+- **`service.go`:** the `Store` interface (`List`, `Get`) is declared here,
+  next to its consumer. `Service` wraps store errors with `%w`, so
+  `errors.Is(err, ErrNotFound)` still works.
+- **`store_memory.go`:** `MemoryStore` (map + `sync.RWMutex`).
+  - `List` sorts by ID, with numeric IDs compared numerically (`"2"` before
+    `"10"`) and any non-numeric IDs after them.
+  - `Get` returns a wrapped `ErrNotFound`.
+- **`seed.go`:** `SeedProducts()`, 9 desserts with IDs `"1"`-`"9"`, marked
+  `// TODO: replace with real catalogue source`.
+- **`http_types.go`:** `ProductResponse{id, name, price float64, category}`
+  matching the spec's Product schema. `toProductResponse` turns cents into a
+  float (650 → 6.5).
+- **`handler.go`:**
+  - `List` always returns an array (`[]`, never `null`).
+  - `Get` returns 400 unless `productId` is digits only and a positive int64.
+    `"007"` is normalized to `"7"`; `+1`, `-1`, `0`, `1.5` and int64 overflow
+    are 400.
+  - `statusFor` uses `errors.Is`: `ErrNotFound` → 404, anything else → 500
+    with a generic message, so internal details never reach the client.
+- **`routes.go`:** `GET /api/product` and `GET /api/product/{productId}`;
+  other methods on those paths get a JSON 405.
+- **Wiring:**
+  - `httpapi.NewRouter(logger, registrars ...Registrar)`. `Registrar` is an
+    interface declared in `httpapi`, so `httpapi` doesn't import any domain
+    package.
+  - `app.New` builds MemoryStore → Service → Handler and passes the handler
+    to the router.
+  - The 405 helper moved from `httpapi` to `httpx.MethodNotAllowed` so
+    domain routes can use it.
+- Removed the empty boilerplate `internal/product/store.go`, which was
+  replaced by the `Store` interface in `service.go` and by
+  `store_memory.go`.
+
+**Spec mapping:** the spec paths `/product` and `/product/{productId}` sit
+under the server base `/api`. `id` is a JSON string, `price` a number, and
+the path parameter an int64, hence the 400 for anything else. The spec gives
+no body for 400 and 404, so both use the `APIError` shape.
+
+**Files:** `internal/product/{product,service,store_memory,seed,http_types,handler,routes}.go`,
+`service_test.go`, `handler_test.go` (new), `internal/httpapi/router.go`,
+`internal/httpx/response.go`, `internal/app/app.go`, `app_test.go`.
+
+**Results**
+- `go build`, `go vet` and `go test -race` pass.
+- **Service tests** (fake Store): `List` with products, empty, and a store
+  error; `Get` found, not found (still `ErrNotFound` after wrapping), and a
+  store error. Each checks the ID passed to the store.
+- **Store and seed tests:** numeric-first sort order, `Get` and not found, an
+  empty store returning `[]`, and seed data that is 5-10 items with unique,
+  valid IDs and complete fields.
+- **Handler tests** (httptest):
+  - List returns an exact JSON body (6.5 / 5.5 / 12.99), `[]` for both an
+    empty store and a store returning a nil slice, and 500 without leaking
+    the error.
+  - Get: 200 for 1, 10 and 0001; 404 for 999 and max int64; 400 for abc, 0,
+    -1, +1, 1.5, int64 overflow and a space.
+  - Also a 500 on store failure, a 405 with `Allow`, `statusFor` including a
+    wrapped error, and the cents conversion.
+- **App test:** `/api/product/1` is reachable through `app.New`.
+- **Smoke test of the binary:** list 200 (9 items), `/3` 200, `/999` 404,
+  `/abc` 400, `DELETE` 405.
+
+---
+
+## 2026-09-26: Order API with coupon validation stub
+
+**What**
+- **`internal/coupon`,** reshaped to the requested API while keeping the real
+  rules and the importer:
+  - `ErrInvalid`.
+  - A `Store` interface (`Has`) declared in `service.go`, with the requested
+    TODO comment plus a note that the importer already loads the codes.
+  - `Service.Validate(ctx, code) error` returns an error matching
+    `ErrInvalid` for malformed or unknown codes (malformed ones skip the
+    store). Store failures come back wrapped as ordinary errors.
+  - `MemoryStore` (a fixed set, empty by default).
+  - The existing Postgres `Store`/`Exists` became `PostgresStore`/`Has`
+    (file `store_postgres.go`); `CodeStore` was replaced by `Store`.
+- **`internal/order`** (new; the empty `store.go` stub was removed):
+  - `Item`, `Order`, `ErrUnknownProduct` and `ErrInvalidCoupon`.
+  - `service.go` declares `ProductLookup`, `CouponValidator` and `Store`.
+  - `Place` merges duplicate product IDs (summing quantities, first-seen
+    order), looks up each product (`product.ErrNotFound` →
+    `ErrUnknownProduct`; other errors stay separate), validates the coupon
+    only when one is given, generates a UUIDv4 with `crypto/rand`, and saves.
+  - `MemoryStore` (map + `sync.Mutex`): copies slices on save and rejects
+    duplicate IDs.
+  - `PlaceOrderRequest.Validate()`: items must be non-empty, `productId`
+    non-empty, quantity 1-100; all problems are reported together.
+  - `OrderResponse{id, items, products}` reuses `product.ToResponse`.
+  - Handler: 400 for any decode failure, 422 for validation errors, unknown
+    products and invalid coupons, 500 with a generic message (real error
+    logged), 200 with the order.
+  - `Register(mux, protect)` wraps `POST /api/order` with `protect`; other
+    methods get a JSON 405 without needing the key.
+- **`internal/product`:** `toProductResponse` exported as `ToResponse` for
+  reuse by order.
+- **`internal/httpapi`:** `RegistrarFunc` (like `http.HandlerFunc`), so
+  `app` can mount `order.Register(mux, protect)` through the router.
+- **`internal/app`:** product service → order service; coupon service with
+  an empty `MemoryStore`; `protect = httpapi.APIKey(cfg.APIKey)`.
+  `*product.Service` and `*coupon.Service` satisfy the order interfaces
+  directly, with no adapter types.
+
+**Why these choices**
+- **How order tells a rejected coupon from a failure:** order may not import
+  coupon, so it can't check `errors.Is(err, coupon.ErrInvalid)`, yet it must
+  not report a database failure as "invalid coupon" (422). Coupon's
+  rejection error also implements `InvalidCoupon() bool`, and order checks
+  for that behavior with `errors.As`, the same pattern as `net.Error`'s
+  `Timeout()`.
+- **Decode failures are all 400:** the spec only allows
+  200/400/401/403/422, so 413 and 415 from `DecodeJSON` become 400 with the
+  original message.
+- **The coupon store is empty for now:** as the task specifies, every coupon
+  is rejected (422) until the API is wired to `PostgresStore`, which needs
+  `DATABASE_URL` in the API config.
+- **Order of checks:** unknown products are checked before the coupon, so a
+  request with both problems reports the product.
+- **Merging can exceed 100:** quantity limits apply per request line, so
+  merged totals can go over 100 (for example 60 + 60).
+
+**Dependency check (`go list`):** product → httpx; coupon → ingest;
+order → httpx, product. product and coupon never import order or each other.
+
+**Files:** `internal/coupon/{coupon,service,store_memory,store_postgres}.go`,
+`coupon_test.go`; `internal/order/{order,service,store_memory,http_types,handler,routes}.go`,
+`service_test.go`, `handler_test.go`; `internal/product/{http_types,handler,handler_test}.go`;
+`internal/httpapi/router.go`; `internal/app/{app,app_test}.go`.
+
+**Results**
+- `go build`, `go vet` and `go test -race` pass.
+- **Service tests,** with fakes for all three interfaces:
+  - Success, merging, valid coupon, invalid coupon, validator failure (not
+    `ErrInvalidCoupon`), unknown product, unknown product reported before the
+    coupon, lookup failure (not `ErrUnknownProduct`), and save failure.
+  - Each checks what was saved and which codes reached the validator.
+  - Also UUIDv4 format and uniqueness, and that `MemoryStore` copies and
+    rejects duplicate IDs.
+- **Handler tests** (httptest with the real `APIKey` middleware):
+  - 200 (exactly the fields id, items and products, with merging and a
+    coupon).
+  - 401 and 403, checked before the body is read.
+  - 400: malformed JSON, empty body, unknown field, wrong types, wrong
+    content type, oversized body.
+  - 422: missing or empty items, missing productId or quantity, quantity
+    0/-1/101, every item error reported, unknown product, invalid coupon.
+  - 500: generic message, no leak, real error logged; plus a 405.
+- **Coupon tests:** `Validate` returns nil, `ErrInvalid` plus
+  `InvalidCoupon()` for unknown, short, long or empty codes (the latter
+  without a store call), and a plain error for a store failure. `MemoryStore`
+  is tested too.
+- **App test:** `POST /api/order` returns 200, 401 or 403 depending on the
+  key, and 422 for a coupon.
+- **Smoke test of the binary:**
+  - 200: duplicates merged (1×2 + 1×1 → quantity 3); response has a UUID id,
+    items and products.
+  - 401 without a key, 403 with a wrong key, 400 for malformed JSON.
+  - 422 for empty items, unknown product 99, and coupon `HAPPYHRS` (empty
+    store).
+
+---
+
+## 2026-09-26: Review fixes 1/3: restore coupon and config contracts
+
+**Context:** a checklist review (read-only report first) found regressions
+against the last pushed commit `8cbe381`. The order task had changed coupon's
+API, and the plumbing task had reshaped `config`. The user confirmed the
+checklist's contract wins: `coupon.Service.Validate(ctx, code) (bool, error)`
+with `Store.Exists`.
+
+**What**
+- **C1, coupon restored to `8cbe381`:** `CodeStore` with `Exists`, and
+  `Store`/`NewStore` (the file is back to `store.go`, byte-identical).
+  `Validate` returns `(bool, error)`. Deleted `invalidError`, the
+  `InvalidCoupon()` behavior check and `coupon.ErrInvalid`.
+- **Order:** `CouponValidator` is `Validate(ctx, code) (bool, error)`. In
+  `Place`, an error becomes a wrapped internal error (500) and `!ok` becomes
+  `ErrInvalidCoupon` (422). Test fakes updated.
+- **C2:** deleted `coupon.MemoryStore`; tests use fakes.
+- **C3, config:**
+  - `Config` gains `DatabaseURL` (required, since both binaries use Postgres),
+    `DataDir` (default `./data`) and `ImportMinFiles` (via
+    `coupon.ParseMinFiles`).
+  - `Load()` returns `(Config, error)` again; `Validate` checks the new
+    fields too.
+  - `cmd/importer` uses `config.Load` and `Validate` and no longer reads the
+    environment itself. `cmd/api` handles the new `Load` error.
+- **N5:** removed the stale TODO in `coupon/service.go`.
+- **N6:** the source file names moved to
+  `coupon.SourceFileNames [SourceFiles]string`, next to `SourceFiles`. It's
+  an array, so callers get a copy.
+- **Keeping the commit working on its own:** with `MemoryStore` gone and the
+  pool not added until commit 2, `app` uses an unexported
+  `noCoupons{}.Exists → false` placeholder, keeping the previous behavior
+  (every coupon rejected). Commit 2 removes it.
+
+**Results**
+- gofmt clean; `go vet`, `go build` and `go test -race` pass.
+- `git diff 8cbe381 -- internal/coupon/` now shows only `SourceFileNames`,
+  one comment line and the tests.
+- **Importer:** without `DATABASE_URL` it fails with "config: DATABASE_URL is
+  required"; with `IMPORT_MIN_FILES=9` it fails with "must be an integer from
+  1 to 3". The API also reports `DATABASE_URL is required`.
+- **New config tests:** `Load` with all 7 variables, defaults, parse errors,
+  and `Validate` cases for the new fields.
+
+---
+
+## 2026-09-26: Review fixes 2/3: use Postgres coupons in the API
+
+**What**
+- **`app.New(ctx, cfg)`:** validates the config, opens the pool with
+  `database.NewPool` (connect + ping), and passes `coupon.NewStore(pool)` to
+  `coupon.NewService`.
+  - `newApp(cfg, out, coupons)` builds everything except the pool, so tests
+    inject a fake `coupon.CodeStore`.
+  - `App.Close()` releases the pool and is safe to call twice.
+  - Removed the temporary `noCoupons` placeholder from commit 1.
+- **`cmd/api`:** 10s startup timeout for the connect and ping; `defer
+  a.Close()` for early returns; after `srv.Shutdown` it calls `a.Close()` and
+  logs "database pool closed".
+- **S3:** compile-time checks in `app`:
+  `var _ order.ProductLookup = (*product.Service)(nil)` and
+  `var _ order.CouponValidator = (*coupon.Service)(nil)`.
+- **docker-compose:** the `api` service already had `DATABASE_URL`; added a
+  comment explaining why, plus `API_KEY: ${API_KEY:-apitest}`.
+- **README:** new API section (endpoints and status codes, env vars, a curl
+  example), noting that coupons come from `valid_codes` and the API starts
+  after the importer.
+
+**Results**
+- gofmt clean; `go vet`, `go build` and `go test -race` pass.
+- **App tests:**
+  - A valid coupon from the injected store returns 200; an unknown one 422.
+  - A store failure returns 500 without leaking details, and the error is
+    logged.
+  - `New` rejects an invalid config before connecting, and fails when the
+    database is unreachable.
+- **Manual check with docker compose** (`docker compose up --build -d`, using
+  the existing volume):
+  - Importer: "valid codes already imported, skipping" (`min_files=2`),
+    exit 0; the api started after it.
+  - Accepted (200): `HAPPYHRS`, `FIFTYOFF` and `OVER9000`, codes that are in
+    `valid_codes`.
+  - Rejected (422): `SUPER100` (only in 1 file), `NOTACODE` and `abc`
+    (malformed, so no database query).
+  - An order without a coupon returns 200.
+  - The first lookup took 9.8 ms while the pool connected; later ones about
+    0.3 ms.
+  - `docker compose stop api` logged "shutting down" → "server stopped" →
+    "database pool closed". Docker was then stopped.
+
+---
+
+## 2026-09-26: Review fixes 3/3: harden order and product handlers
+
+**What**
+- **S1:** `product.NewHandler(svc, logger)`. On a 500 the handler logs the
+  real error (`ErrorContext`, with the request context) before writing the
+  generic message; 404s aren't logged.
+- **S4:** `Place` checks each product's total after merging duplicates (at
+  most `MaxQuantity`, 100) and returns 422 `ErrQuantityLimit` if exceeded.
+  `MinQuantity` and `MaxQuantity` moved to `order.go` and are shared with
+  `PlaceOrderRequest.Validate`.
+- **S5:** new `order.InputError{Err, Value}`, where `Err` is the sentinel and
+  `Value` the offending productId or coupon code, with `Unwrap()` returning
+  the sentinel.
+  - `Place` returns it for an unknown product, an invalid coupon and the
+    quantity limit.
+  - The handler's `clientMessage` builds the 422 text as
+    `sentinel.Error() + ": " + quoted value`, never from `err.Error()` of the
+    chain.
+  - The 400 path uses `RequestError.Message` instead of `err.Error()`.
+  - `statusFor` checks one list of 422 sentinels.
+- **N1:** `Item(it)` and `ItemRequest(it)` conversions (staticcheck S1016).
+- **N4:** `APIKey` hashes the configured key once and each presented key per
+  request with SHA-256, then compares the digests with
+  `subtle.ConstantTimeCompare`. Equal-length digests mean response timing no
+  longer reveals the key's length.
+
+**Results**
+- gofmt clean; `go vet`, `go build` and `go test -race` pass. **staticcheck
+  is now clean** (the 2 S1016 findings are gone).
+- **New tests:**
+  - Service: a merged total of exactly 100 passes; 60 + 1 + 60 fails with
+    `ErrQuantityLimit` and nothing is saved.
+  - `InputError` carries the right sentinel and value for all three cases.
+  - Handler: a merged quantity over 100 returns 422
+    `total quantity per product must not exceed 100: "1"`; exact messages
+    for an unknown product (`"99"`) and an invalid coupon.
+  - `clientMessage` doesn't leak wrapping context
+    ("tx 42 on db-primary: …" becomes just `invalid coupon: "NOPE1234"`).
+  - Product: store failures on both routes are logged and not leaked, and a
+    404 isn't logged.
+  - `APIKey`: a much longer key and a single-character key both get 403.
+- No handler writes `err.Error()` of a service error to the client anymore.
+
+---
+
+## 2026-09-26: Review fixes verified by the user on the real stack
+
+The user ran the verification checklist; every check passed:
+- **Config:** errors for a missing `DATABASE_URL` (importer and api) and
+  `IMPORT_MIN_FILES=9`, all with exit code 1.
+- **Stack start:** `docker compose up --build -d` → importer `Exited (0)`,
+  api `Up`, `/healthz` ok.
+- **Coupons from Postgres:** `HAPPYHRS` → 200; `SUPER100` and `NOTACODE` →
+  422 `invalid coupon: "..."`.
+- **Merging:** 60 + 40 merged → 200 with `quantity:100`; 60 + 41 → 422
+  `total quantity per product must not exceed 100: "1"`; product 99 → 422
+  `unknown product: "99"`.
+- **API key:** none → 401; `a` and a long wrong key → 403.
+- **Shutdown:** `docker compose stop api` → "shutting down" → "server
+  stopped" → "database pool closed".
+
+---
+
+## 2026-09-26: README rewrite and Low-Level Design document
+
+**What**
+- **`README.md`,** rewritten for people running and using the service:
+  - Quick start, prerequisites (Docker with 4 GB or more), project layout,
+    and running with Compose or locally.
+  - All 7 environment variables, with which binary uses each.
+  - API reference with request/response examples and request rules, plus an
+    error table (status → type → when).
+  - Promo-code rules and the 8 valid codes, testing commands, and a
+    troubleshooting table.
+- **`docs/LLD.md`** (new), for people working on the code. Sections:
+  - Scope; package dependency graph and rules; per-domain file layering.
+  - Package responsibilities.
+  - Composition and lifecycle (object graph, startup/shutdown sequence,
+    timeouts).
+  - HTTP layer: middleware order and reasons, 404/405 routing, DecodeJSON
+    rules, response helpers.
+  - Domains: product, order (`Place` algorithm), coupon lookup contract.
+  - Sequence diagrams for GET product and POST order.
+  - Importer: pipeline, steps, streaming reader, `uint64` encoding, merge
+    algorithm, memory profile, idempotency state machine.
+  - Data model, error model, concurrency table, security measures.
+  - Design decisions D1-D7, including the measured all-rows vs valid-only
+    comparison.
+  - Testing strategy, and known limitations with possible fixes.
+- **No duplication between them:** the README covers what and how to use; the
+  LLD covers how it works and why. The design and "why the rule is applied at
+  import time" sections moved from the README into the LLD (§8, §13 D1). Each
+  document links to the other, and the README also links to `CODE_LOG.md`.
+- Mermaid diagrams (8 in the LLD) render on GitHub.
+
+**Verification:** every number and behavior quoted was checked against the
+code (constants, locking, timeouts, limits, 37¹⁰ < 2⁵³), and every relative
+link resolves.
+
+---
+
+## 2026-09-27: CORS support
+
+**Why:** a browser front end on another origin couldn't call the API. No CORS
+headers were sent, and the preflight a browser sends before
+`POST /api/order` (because of the JSON body and the `api_key` header) got a
+405, so every order from a web page was blocked.
+
+**What**
+- **Config:** `CORS_ALLOWED_ORIGINS` becomes `Config.AllowedOrigins
+  []string`: comma-separated, spaces trimmed, empty entries dropped, default
+  `*`.
+  - `Validate` requires a non-empty list. `*` must be the only entry if used;
+    otherwise each entry must be exactly `http(s)://host[:port]` in lower
+    case, with no path, query or trailing slash (browsers send origins in
+    that form, and matching is exact).
+- **`httpapi.CORS(allowed)`** (new `cors.go`):
+  - No `Origin` header → pass through unchanged.
+  - Preflight (`OPTIONS` + `Access-Control-Request-Method`) → 204 with
+    `Allow-Methods: GET, HEAD, POST, OPTIONS`, `Allow-Headers: Content-Type,
+    api_key, X-Request-ID` and `Max-Age: 600` for allowed origins, or a 403
+    APIError otherwise. It never reaches the routes, so no `api_key` is
+    needed.
+  - Other requests from an allowed origin get `Access-Control-Allow-Origin`
+    (`*`, or the echoed origin plus `Vary: Origin`) and
+    `Expose-Headers: X-Request-ID`, on every response including errors.
+  - Credentials are never allowed.
+- **Router:** `NewRouter(logger, allowedOrigins, registrars...)`. The chain
+  is now RequestID → Logger → **CORS** → Recover → mux, so preflights are
+  logged with an ID and run before any route or the API-key check. `app`
+  passes `cfg.AllowedOrigins`.
+- **docker-compose:** `CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"`
+  on the api service.
+- **Docs:** the README gets the setting, a paragraph on browser use and two
+  troubleshooting rows. The LLD gets CORS in the middleware diagram and
+  table, the httpapi row, and the security table.
+
+**Why a `*` default is OK:** authentication is a header key, not cookies, and
+`Allow-Credentials` is never sent, so a malicious site can't borrow a user's
+session. Production deployments can still pin exact origins.
+
+**Files:** `internal/httpapi/{cors,cors_test,router,router_test}.go`,
+`internal/config/{config,config_test}.go`, `internal/app/{app,app_test}.go`,
+`docker-compose.yml`, `README.md`, `docs/LLD.md`.
+
+**Results**
+- gofmt clean; `go vet`, `go build`, `go test -race` and staticcheck pass.
+- **Tests:**
+  - `TestCORS`, 10 cases: no Origin, wildcard, echoed origin, second
+    allowed origin, disallowed origin, exact-match-only, preflight
+    wildcard/allowed/disallowed, and `OPTIONS` without a request method
+    passing through. It also checks `Vary`, `Expose-Headers` and that
+    credentials are never allowed.
+  - A preflight allows `POST`, `GET`, `Content-Type`, `api_key` and
+    `X-Request-ID`.
+  - Config: parsing with spaces and empties, plus 7 invalid-origin cases.
+  - `TestBrowserCORSFlow` (full app): preflight without a key → 204; order →
+    200; 401 and 422 carry `Allow-Origin`; another site gets a 403
+    preflight and no CORS headers.
+- **Real server** (native api against the Compose db,
+  `CORS_ALLOWED_ORIGINS=https://shop.example.com,http://localhost:3000`):
+  - Preflight from `localhost:3000` → 204 with every header above.
+  - `evil.example` → 403 `origin not allowed`.
+  - POST with key → 200 with `Allow-Origin` and `Expose-Headers`; POST
+    without key → 401 still carrying `Allow-Origin`.
+  - A request without `Origin` gets no CORS headers.
+  - Preflights are logged with request IDs.
+  - `docker compose config` is valid (`CORS_ALLOWED_ORIGINS: '*'`). Docker
+    was stopped afterwards.
+
+---
+
+## Open items
+
+- Review fixes 1-3 and the README/LLD docs pushed to `dev` on 2026-09-27. Deferred from the review: S2 (move the
+  importer's SQL into a store), S6 (integration tests for the importer and
+  `coupon.Store`), N2 (unknown-field detection matches error text), N3
+  (in-memory order store grows forever).
+- Still planned: `scripts/stats.sql` + `make stats`, `make verify`, and an
+  integration test.
+- `f1a2d1f`, `6f6b080` and the Docker-timing docs commit pushed to `dev` on 2026-09-26.
