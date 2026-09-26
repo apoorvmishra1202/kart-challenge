@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16
+    shm_size: 1g # parallel index builds use shared memory
+    environment:
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+      POSTGRES_DB: shop
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shop -d shop"]
+      interval: 5s
+      retries: 10
+
+  importer:
+    build: .
+    command: ["/app/importer"]
+    environment:
+      DATABASE_URL: postgres://shop:shop@db:5432/shop?sslmode=disable
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: ["/app/api"]
+    environment:
+      DATABASE_URL: postgres://shop:shop@db:5432/shop?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      importer:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:

@@ -1,0 +1,5 @@
+testdata/
+data/
+bin/
+.env
+.DS_Store
