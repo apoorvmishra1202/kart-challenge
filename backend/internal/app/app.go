@@ -84,7 +84,7 @@ func newApp(cfg config.Config, out io.Writer, coupons coupon.CodeStore) (*App, e
 	return &App{
 		Config: cfg,
 		Logger: logger,
-		Handler: httpapi.NewRouter(logger,
+		Handler: httpapi.NewRouter(logger, cfg.AllowedOrigins,
 			productHandler,
 			httpapi.RegistrarFunc(func(mux *http.ServeMux) { orderHandler.Register(mux, protect) }),
 		),

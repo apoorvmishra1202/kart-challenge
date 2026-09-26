@@ -9,7 +9,7 @@ import (
 )
 
 func TestRouter(t *testing.T) {
-	h := NewRouter(discardLogger())
+	h := NewRouter(discardLogger(), []string{"*"})
 	tests := []struct {
 		name       string
 		method     string

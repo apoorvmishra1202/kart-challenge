@@ -20,9 +20,10 @@ type RegistrarFunc func(mux *http.ServeMux)
 func (f RegistrarFunc) Register(mux *http.ServeMux) { f(mux) }
 
 // NewRouter returns the API handler with the standard middleware applied and
-// every registrar's routes mounted. Unknown routes get a JSON 404 and known
-// paths with the wrong method a JSON 405, both in the APIError shape.
-func NewRouter(logger *slog.Logger, registrars ...Registrar) http.Handler {
+// every registrar's routes mounted. allowedOrigins configures CORS (see
+// CORS). Unknown routes get a JSON 404 and known paths with the wrong method
+// a JSON 405, both in the APIError shape.
+func NewRouter(logger *slog.Logger, allowedOrigins []string, registrars ...Registrar) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -40,5 +41,7 @@ func NewRouter(logger *slog.Logger, registrars ...Registrar) http.Handler {
 		httpx.WriteError(w, http.StatusNotFound, httpx.TypeNotFound, "route not found")
 	})
 
-	return chain(mux, RequestID, Logger(logger), Recover(logger))
+	// CORS sits after RequestID and Logger so preflights are logged with an
+	// ID, and before the routes so preflights never need the api_key.
+	return chain(mux, RequestID, Logger(logger), CORS(allowedOrigins), Recover(logger))
 }

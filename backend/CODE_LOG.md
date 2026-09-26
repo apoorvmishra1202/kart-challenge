@@ -959,6 +959,77 @@ link resolves.
 
 ---
 
+## 2026-09-27: CORS support
+
+**Why:** a browser front end on another origin couldn't call the API. No CORS
+headers were sent, and the preflight a browser sends before
+`POST /api/order` (because of the JSON body and the `api_key` header) got a
+405, so every order from a web page was blocked.
+
+**What**
+- **Config:** `CORS_ALLOWED_ORIGINS` becomes `Config.AllowedOrigins
+  []string`: comma-separated, spaces trimmed, empty entries dropped, default
+  `*`.
+  - `Validate` requires a non-empty list. `*` must be the only entry if used;
+    otherwise each entry must be exactly `http(s)://host[:port]` in lower
+    case, with no path, query or trailing slash (browsers send origins in
+    that form, and matching is exact).
+- **`httpapi.CORS(allowed)`** (new `cors.go`):
+  - No `Origin` header → pass through unchanged.
+  - Preflight (`OPTIONS` + `Access-Control-Request-Method`) → 204 with
+    `Allow-Methods: GET, HEAD, POST, OPTIONS`, `Allow-Headers: Content-Type,
+    api_key, X-Request-ID` and `Max-Age: 600` for allowed origins, or a 403
+    APIError otherwise. It never reaches the routes, so no `api_key` is
+    needed.
+  - Other requests from an allowed origin get `Access-Control-Allow-Origin`
+    (`*`, or the echoed origin plus `Vary: Origin`) and
+    `Expose-Headers: X-Request-ID`, on every response including errors.
+  - Credentials are never allowed.
+- **Router:** `NewRouter(logger, allowedOrigins, registrars...)`. The chain
+  is now RequestID → Logger → **CORS** → Recover → mux, so preflights are
+  logged with an ID and run before any route or the API-key check. `app`
+  passes `cfg.AllowedOrigins`.
+- **docker-compose:** `CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"`
+  on the api service.
+- **Docs:** the README gets the setting, a paragraph on browser use and two
+  troubleshooting rows. The LLD gets CORS in the middleware diagram and
+  table, the httpapi row, and the security table.
+
+**Why a `*` default is OK:** authentication is a header key, not cookies, and
+`Allow-Credentials` is never sent, so a malicious site can't borrow a user's
+session. Production deployments can still pin exact origins.
+
+**Files:** `internal/httpapi/{cors,cors_test,router,router_test}.go`,
+`internal/config/{config,config_test}.go`, `internal/app/{app,app_test}.go`,
+`docker-compose.yml`, `README.md`, `docs/LLD.md`.
+
+**Results**
+- gofmt clean; `go vet`, `go build`, `go test -race` and staticcheck pass.
+- **Tests:**
+  - `TestCORS`, 10 cases: no Origin, wildcard, echoed origin, second
+    allowed origin, disallowed origin, exact-match-only, preflight
+    wildcard/allowed/disallowed, and `OPTIONS` without a request method
+    passing through. It also checks `Vary`, `Expose-Headers` and that
+    credentials are never allowed.
+  - A preflight allows `POST`, `GET`, `Content-Type`, `api_key` and
+    `X-Request-ID`.
+  - Config: parsing with spaces and empties, plus 7 invalid-origin cases.
+  - `TestBrowserCORSFlow` (full app): preflight without a key → 204; order →
+    200; 401 and 422 carry `Allow-Origin`; another site gets a 403
+    preflight and no CORS headers.
+- **Real server** (native api against the Compose db,
+  `CORS_ALLOWED_ORIGINS=https://shop.example.com,http://localhost:3000`):
+  - Preflight from `localhost:3000` → 204 with every header above.
+  - `evil.example` → 403 `origin not allowed`.
+  - POST with key → 200 with `Allow-Origin` and `Expose-Headers`; POST
+    without key → 401 still carrying `Allow-Origin`.
+  - A request without `Origin` gets no CORS headers.
+  - Preflights are logged with request IDs.
+  - `docker compose config` is valid (`CORS_ALLOWED_ORIGINS: '*'`). Docker
+    was stopped afterwards.
+
+---
+
 ## Open items
 
 - Review fixes 1-3 and the README/LLD docs pushed to `dev` on 2026-09-27. Deferred from the review: S2 (move the

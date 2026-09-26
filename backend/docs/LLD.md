@@ -124,7 +124,7 @@ types.
 | `config` | Read env vars with defaults; validate everything, reporting all errors together | `Config`, `Load() (Config, error)`, `(Config).Validate()`, `SlogLevel()` |
 | `database` | Create a pgx pool (max 4 connections) and ping it | `NewPool(ctx, url)` |
 | `httpx` | JSON encode/decode helpers; the uniform error body | `APIError`, `WriteJSON`, `WriteError`, `DecodeJSON[T]`, `RequestError`, `MethodNotAllowed` |
-| `httpapi` | Router assembly and cross-cutting middleware | `NewRouter`, `Registrar`, `RegistrarFunc`, `RequestID`, `Logger`, `Recover`, `APIKey` |
+| `httpapi` | Router assembly and cross-cutting middleware | `NewRouter`, `Registrar`, `RegistrarFunc`, `RequestID`, `Logger`, `CORS`, `Recover`, `APIKey` |
 | `product` | Catalogue: list and get | `Product`, `Service`, `Store`, `MemoryStore`, `Handler`, `ToResponse` |
 | `order` | Order placement | `Order`, `Item`, `Service.Place`, `InputError`, `ProductLookup`, `CouponValidator`, `Store`, `MemoryStore`, `Handler` |
 | `coupon` | Promo-code rules, lookup, and the import pipeline | `IsWellFormed`, `Service.Validate`, `CodeStore`, `Store`, `Importer`, `Encode`/`Decode`, `SortUnique`, `MergeValid` |
@@ -206,7 +206,8 @@ deferred for early returns and also called explicitly after `Shutdown`; pgx's
 
 ```mermaid
 graph LR
-  req((request)) --> RID[RequestID] --> LOG[Logger] --> REC[Recover] --> MUX[ServeMux]
+  req((request)) --> RID[RequestID] --> LOG[Logger] --> CORS[CORS] --> REC[Recover] --> MUX[ServeMux]
+  CORS -- "preflight: 204 / 403" --> done((response))
   MUX --> P1[GET /api/product*]
   MUX --> AK[APIKey] --> O1[POST /api/order]
   MUX --> H[GET /healthz]
@@ -217,6 +218,7 @@ graph LR
 |---|---|---|
 | `RequestID` | Reuse `X-Request-ID` if printable ASCII, no spaces, ≤ 128 chars; else 16 random bytes → 32 hex chars. Stored in the context and echoed in the response. | Outermost so every later log line has the ID. |
 | `Logger` | Wraps the writer in a `statusRecorder`; logs method, path, status, bytes, duration, request ID (level `error` for 5xx). | Outside `Recover` so a recovered panic is logged as 500. |
+| `CORS` | Configured by `CORS_ALLOWED_ORIGINS` (`*` or exact origins). No `Origin` → pass through. Preflight (`OPTIONS` + `Access-Control-Request-Method`): 204 with allowed methods (`GET, HEAD, POST, OPTIONS`), headers (`Content-Type, api_key, X-Request-ID`) and `Max-Age: 600` for allowed origins, 403 otherwise; never reaches the routes. Other requests from allowed origins get `Access-Control-Allow-Origin` (`*` or the echoed origin, with `Vary: Origin`) and `Expose-Headers: X-Request-ID`. Credentials are never allowed. | After `Logger` so preflights are logged with an ID; before the mux so preflights don't need the `api_key` and every response (errors included) carries CORS headers. |
 | `Recover` | Converts a panic to a 500 `APIError` and logs the value with its stack. Re-panics `http.ErrAbortHandler`. Does not write if the response had already started. | Innermost global middleware, closest to handlers. |
 | `APIKey` | Per-route (only `POST /api/order`): 401 if the header is missing or empty, 403 if wrong. | Runs before the body is read, so unauthenticated requests never reach JSON decoding. |
 
@@ -599,6 +601,7 @@ All tests run clean under `go test -race`.
 |---|---|
 | API key comparison | SHA-256 of the configured key (once) and of the presented key (per request), compared with `subtle.ConstantTimeCompare`; equal-length digests hide both content and length timing. |
 | Default credentials | `API_KEY=apitest` is rejected when `APP_ENV=production`. |
+| Cross-origin access | CORS allow-list (`CORS_ALLOWED_ORIGINS`, exact origins validated at startup). A `*` default is acceptable because authentication is a header key, not cookies, and `Access-Control-Allow-Credentials` is never sent. Disallowed origins get a 403 preflight and no CORS headers. |
 | Oversized / hostile bodies | `MaxBytesReader` (64 KB for orders), strict decoding, unknown fields rejected. |
 | Slow clients | Read-header/read/write/idle timeouts (§4.2). |
 | Log/header injection | Client `X-Request-ID` accepted only if printable ASCII without spaces, ≤ 128 chars. |

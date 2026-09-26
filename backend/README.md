@@ -123,6 +123,7 @@ when anything is invalid, listing every problem at once.
 |---|---|---|---|
 | `DATABASE_URL` | — (**required**) | api, importer | Postgres connection string |
 | `API_KEY` | `apitest` | api | Value required in the `api_key` header for `POST /api/order`. Must be changed when `APP_ENV=production`. |
+| `CORS_ALLOWED_ORIGINS` | `*` | api | Browser origins allowed to call the API: `*` (any) or a comma-separated list of exact origins, e.g. `https://shop.example.com,http://localhost:3000` |
 | `HTTP_ADDR` | `:8080` | api | Listen address (`host:port` or `:port`) |
 | `APP_ENV` | `development` | api | `development`, `test` or `production` (production logs JSON) |
 | `LOG_LEVEL` | `info` | api | `debug`, `info`, `warn` or `error` |
@@ -134,6 +135,11 @@ when anything is invalid, listing every problem at once.
 Base URL `http://localhost:8080`. Request and response bodies are JSON. Every
 response carries an `X-Request-ID` header (your own is echoed back if it is
 well-formed), and the same ID appears in the server log line for the request.
+
+Browsers on the origins in `CORS_ALLOWED_ORIGINS` can call the API directly:
+preflight (`OPTIONS`) requests are answered without the `api_key`, and every
+response, including errors, carries the CORS headers so the page can read it.
+`X-Request-ID` is readable from JavaScript.
 
 | Method | Path | Auth | Success |
 |---|---|---|---|
@@ -269,3 +275,5 @@ Expected output: `200`, then `422`.
 | `422 invalid coupon` for a code you expect to be valid | Codes are case-sensitive and must be 8–10 characters. Also check which `IMPORT_MIN_FILES` the last import used. |
 | `listen on :8080: address already in use` | Another process has the port; stop it or set `HTTP_ADDR`. |
 | `API_KEY must be changed from the default in production` | Set a real `API_KEY` when `APP_ENV=production`. |
+| Browser console: `blocked by CORS policy` | Add the page's exact origin (scheme, host, port; no trailing slash) to `CORS_ALLOWED_ORIGINS`, or use `*`. |
+| `CORS_ALLOWED_ORIGINS: "…" must look like https://host[:port]` | Remove any path or trailing slash and use lower case, e.g. `https://shop.example.com`. |
