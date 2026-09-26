@@ -11,24 +11,56 @@ import (
 
 	"shop/internal/config"
 	"shop/internal/coupon"
+	"shop/internal/database"
 	"shop/internal/httpapi"
 	"shop/internal/order"
 	"shop/internal/product"
+)
+
+// The services plug into order directly, with no adapter types.
+var (
+	_ order.ProductLookup   = (*product.Service)(nil)
+	_ order.CouponValidator = (*coupon.Service)(nil)
 )
 
 type App struct {
 	Config  config.Config
 	Logger  *slog.Logger
 	Handler http.Handler
+
+	close func()
 }
 
-// New validates cfg and builds the logger and router. Logs are JSON in
-// production and human-readable text otherwise, written to stdout.
-func New(cfg config.Config) (*App, error) {
-	return newApp(cfg, os.Stdout)
+// New validates cfg, opens the database pool (verifying the database is
+// reachable), and builds the logger and router. Logs are JSON in production
+// and human-readable text otherwise, written to stdout. Call Close when done.
+func New(ctx context.Context, cfg config.Config) (*App, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	pool, err := database.NewPool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	a, err := newApp(cfg, os.Stdout, coupon.NewStore(pool))
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	a.close = pool.Close
+	return a, nil
 }
 
-func newApp(cfg config.Config, out io.Writer) (*App, error) {
+// Close releases the database pool. It is safe to call more than once.
+func (a *App) Close() {
+	if a.close != nil {
+		a.close()
+	}
+}
+
+// newApp builds everything except the pool, so tests can pass a fake
+// coupon store.
+func newApp(cfg config.Config, out io.Writer, coupons coupon.CodeStore) (*App, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -42,7 +74,7 @@ func newApp(cfg config.Config, out io.Writer) (*App, error) {
 	logger := slog.New(h).With("env", cfg.Env)
 
 	productSvc := product.NewService(product.NewMemoryStore(product.SeedProducts()))
-	couponSvc := coupon.NewService(noCoupons{})
+	couponSvc := coupon.NewService(coupons)
 	orderSvc := order.NewService(order.NewMemoryStore(), productSvc, couponSvc)
 
 	productHandler := product.NewHandler(productSvc)
@@ -58,9 +90,3 @@ func newApp(cfg config.Config, out io.Writer) (*App, error) {
 		),
 	}, nil
 }
-
-// noCoupons rejects every code. Temporary: replaced by coupon.NewStore(pool)
-// once the API opens a database pool.
-type noCoupons struct{}
-
-func (noCoupons) Exists(context.Context, string) (bool, error) { return false, nil }

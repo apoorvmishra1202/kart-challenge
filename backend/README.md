@@ -1,5 +1,34 @@
 Backend for the kart challenge. Work in progress.
 
+## API
+
+Implements `api/openapi.yaml` under `/api`:
+
+| Endpoint | Auth | Notes |
+|---|---|---|
+| `GET /api/product` | none | JSON array of products |
+| `GET /api/product/{productId}` | none | 400 if the ID isn't a positive integer, 404 if unknown |
+| `POST /api/order` | `api_key` header | 401 missing key, 403 wrong key, 400 bad JSON, 422 validation (empty items, quantity outside 1–100, unknown product, invalid coupon) |
+| `GET /healthz` | none | `{"status":"ok"}` |
+
+Coupon codes in orders are checked against `valid_codes` in Postgres (see
+below), so the API needs the database and starts only after the importer has
+finished (`docker compose up --build` handles the order).
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | (required) | Postgres connection string |
+| `API_KEY` | `apitest` | Key for the `api_key` header (must be changed when `APP_ENV=production`) |
+| `HTTP_ADDR` | `:8080` | Listen address |
+| `APP_ENV` | `development` | `development`, `test` or `production` (JSON logs) |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+
+```sh
+curl -X POST http://localhost:8080/api/order \
+  -H 'Content-Type: application/json' -H 'api_key: apitest' \
+  -d '{"couponCode":"HAPPYHRS","items":[{"productId":"1","quantity":2}]}'
+```
+
 ## Coupon import
 
 A promo code is valid when it is 8–10 characters long **and** appears in at

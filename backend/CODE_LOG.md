@@ -812,12 +812,55 @@ with `Store.Exists`.
 
 ---
 
+## 2026-09-26: Review fixes 2/3: use Postgres coupons in the API
+
+**What**
+- **`app.New(ctx, cfg)`:** validates the config, opens the pool with
+  `database.NewPool` (connect + ping), and passes `coupon.NewStore(pool)` to
+  `coupon.NewService`.
+  - `newApp(cfg, out, coupons)` builds everything except the pool, so tests
+    inject a fake `coupon.CodeStore`.
+  - `App.Close()` releases the pool and is safe to call twice.
+  - Removed the temporary `noCoupons` placeholder from commit 1.
+- **`cmd/api`:** 10s startup timeout for the connect and ping; `defer
+  a.Close()` for early returns; after `srv.Shutdown` it calls `a.Close()` and
+  logs "database pool closed".
+- **S3:** compile-time checks in `app`:
+  `var _ order.ProductLookup = (*product.Service)(nil)` and
+  `var _ order.CouponValidator = (*coupon.Service)(nil)`.
+- **docker-compose:** the `api` service already had `DATABASE_URL`; added a
+  comment explaining why, plus `API_KEY: ${API_KEY:-apitest}`.
+- **README:** new API section (endpoints and status codes, env vars, a curl
+  example), noting that coupons come from `valid_codes` and the API starts
+  after the importer.
+
+**Results**
+- gofmt clean; `go vet`, `go build` and `go test -race` pass.
+- **App tests:**
+  - A valid coupon from the injected store returns 200; an unknown one 422.
+  - A store failure returns 500 without leaking details, and the error is
+    logged.
+  - `New` rejects an invalid config before connecting, and fails when the
+    database is unreachable.
+- **Manual check with docker compose** (`docker compose up --build -d`, using
+  the existing volume):
+  - Importer: "valid codes already imported, skipping" (`min_files=2`),
+    exit 0; the api started after it.
+  - Accepted (200): `HAPPYHRS`, `FIFTYOFF` and `OVER9000`, codes that are in
+    `valid_codes`.
+  - Rejected (422): `SUPER100` (only in 1 file), `NOTACODE` and `abc`
+    (malformed, so no database query).
+  - An order without a coupon returns 200.
+  - The first lookup took 9.8 ms while the pool connected; later ones about
+    0.3 ms.
+  - `docker compose stop api` logged "shutting down" → "server stopped" →
+    "database pool closed". Docker was then stopped.
+
+---
+
 ## Open items
 
-- Product and order APIs done. Next: wire real coupons into the API by adding
-  `DATABASE_URL` to `config.Config`, building a pgx pool in `app`, and using
-  `coupon.NewPostgresStore(pool)` instead of the empty `MemoryStore`. Then
-  have `api` in docker-compose use the database the importer filled.
+- Real coupons are wired into the API (done in review fix 2/3).
 - Still planned: `scripts/stats.sql` + `make stats`, `make verify`, and an
   integration test.
 - `f1a2d1f`, `6f6b080` and the Docker-timing docs commit pushed to `dev` on 2026-09-26.

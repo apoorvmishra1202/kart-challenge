@@ -2,6 +2,8 @@ package app
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,7 +26,7 @@ func TestNew(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer
-			a, err := newApp(tt.cfg, &out)
+			a, err := newApp(tt.cfg, &out, fakeCodes{"HAPPYHRS": true})
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("want error")
@@ -52,8 +54,9 @@ func TestNew(t *testing.T) {
 				{tt.cfg.APIKey, `{"items":[{"productId":"1","quantity":1}]}`, http.StatusOK},
 				{"", `{"items":[{"productId":"1","quantity":1}]}`, http.StatusUnauthorized},
 				{"wrong", `{"items":[{"productId":"1","quantity":1}]}`, http.StatusForbidden},
-				// No coupons are loaded yet, so any code is rejected.
-				{tt.cfg.APIKey, `{"couponCode":"HAPPYHRS","items":[{"productId":"1","quantity":1}]}`, http.StatusUnprocessableEntity},
+				// Coupons come from the injected store (Postgres in production).
+				{tt.cfg.APIKey, `{"couponCode":"HAPPYHRS","items":[{"productId":"1","quantity":1}]}`, http.StatusOK},
+				{tt.cfg.APIKey, `{"couponCode":"NOTACODE","items":[{"productId":"1","quantity":1}]}`, http.StatusUnprocessableEntity},
 			} {
 				r := httptest.NewRequest(http.MethodPost, "/api/order", strings.NewReader(c.body))
 				r.Header.Set("Content-Type", "application/json")
@@ -70,5 +73,51 @@ func TestNew(t *testing.T) {
 				t.Errorf("log output %q, want JSON = %v", out.String(), tt.wantJSON)
 			}
 		})
+	}
+}
+
+// fakeCodes is a coupon.CodeStore over a fixed set of codes.
+type fakeCodes map[string]bool
+
+func (f fakeCodes) Exists(_ context.Context, code string) (bool, error) { return f[code], nil }
+
+type failingCodes struct{}
+
+func (failingCodes) Exists(context.Context, string) (bool, error) {
+	return false, errors.New("connection refused")
+}
+
+func TestCouponStoreFailureIs500(t *testing.T) {
+	cfg := config.Config{Env: "test", HTTPAddr: ":0", LogLevel: "error", APIKey: "k", DatabaseURL: "postgres://x", DataDir: "./data", ImportMinFiles: 2}
+	var out bytes.Buffer
+	a, err := newApp(cfg, &out, failingCodes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/api/order",
+		strings.NewReader(`{"couponCode":"HAPPYHRS","items":[{"productId":"1","quantity":1}]}`))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("api_key", "k")
+	w := httptest.NewRecorder()
+	a.Handler.ServeHTTP(w, r)
+	if w.Code != http.StatusInternalServerError || strings.Contains(w.Body.String(), "connection refused") {
+		t.Errorf("got %d %s; want 500 without internal details", w.Code, w.Body)
+	}
+	if !strings.Contains(out.String(), "connection refused") {
+		t.Errorf("store error not logged: %s", out.String())
+	}
+}
+
+func TestNewRejectsInvalidConfigBeforeConnecting(t *testing.T) {
+	if _, err := New(context.Background(), config.Config{}); err == nil {
+		t.Fatal("want config error")
+	}
+}
+
+func TestNewFailsWhenDatabaseUnreachable(t *testing.T) {
+	cfg := config.Config{Env: "test", HTTPAddr: ":0", LogLevel: "error", APIKey: "k",
+		DatabaseURL: "postgres://shop:shop@127.0.0.1:1/shop?sslmode=disable&connect_timeout=1", DataDir: "./data", ImportMinFiles: 2}
+	if _, err := New(context.Background(), cfg); err == nil {
+		t.Fatal("want connection error")
 	}
 }

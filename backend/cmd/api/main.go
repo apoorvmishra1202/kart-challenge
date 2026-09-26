@@ -22,6 +22,7 @@ const (
 	writeTimeout      = 15 * time.Second
 	idleTimeout       = 60 * time.Second
 	shutdownTimeout   = 10 * time.Second
+	startupTimeout    = 10 * time.Second // database connect + ping
 )
 
 func main() {
@@ -36,10 +37,13 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	a, err := app.New(cfg)
+	startCtx, cancelStart := context.WithTimeout(context.Background(), startupTimeout)
+	a, err := app.New(startCtx, cfg)
+	cancelStart()
 	if err != nil {
-		return fmt.Errorf("config: %w", err)
+		return fmt.Errorf("startup: %w", err)
 	}
+	defer a.Close() // covers early returns; the normal path closes explicitly below
 	log := a.Logger
 
 	// Listen before serving so a bad or busy address fails startup with a
@@ -83,5 +87,7 @@ func run() error {
 		return fmt.Errorf("serve: %w", err)
 	}
 	log.Info("server stopped")
+	a.Close()
+	log.Info("database pool closed")
 	return nil
 }
