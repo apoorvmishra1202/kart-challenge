@@ -40,6 +40,11 @@ func TestNew(t *testing.T) {
 			if w.Code != http.StatusOK {
 				t.Errorf("healthz status = %d", w.Code)
 			}
+			w = httptest.NewRecorder()
+			a.Handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/product/1", nil))
+			if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"1"`) {
+				t.Errorf("product route not wired: %d %s", w.Code, w.Body)
+			}
 			if isJSON := strings.HasPrefix(out.String(), "{"); isJSON != tt.wantJSON {
 				t.Errorf("log output %q, want JSON = %v", out.String(), tt.wantJSON)
 			}

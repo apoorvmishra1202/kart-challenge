@@ -598,10 +598,80 @@ running inside Docker.
 
 ---
 
+## 2026-09-26: Product API
+
+**What** (`internal/product/`, standard library only)
+- **`product.go`:** `Product{ID, Name, Price int64 (cents), Category}` with
+  no JSON tags, and `ErrNotFound`.
+- **`service.go`:** the `Store` interface (`List`, `Get`) is declared here,
+  next to its consumer. `Service` wraps store errors with `%w`, so
+  `errors.Is(err, ErrNotFound)` still works.
+- **`store_memory.go`:** `MemoryStore` (map + `sync.RWMutex`).
+  - `List` sorts by ID, with numeric IDs compared numerically (`"2"` before
+    `"10"`) and any non-numeric IDs after them.
+  - `Get` returns a wrapped `ErrNotFound`.
+- **`seed.go`:** `SeedProducts()`, 9 desserts with IDs `"1"`-`"9"`, marked
+  `// TODO: replace with real catalogue source`.
+- **`http_types.go`:** `ProductResponse{id, name, price float64, category}`
+  matching the spec's Product schema. `toProductResponse` turns cents into a
+  float (650 → 6.5).
+- **`handler.go`:**
+  - `List` always returns an array (`[]`, never `null`).
+  - `Get` returns 400 unless `productId` is digits only and a positive int64.
+    `"007"` is normalized to `"7"`; `+1`, `-1`, `0`, `1.5` and int64 overflow
+    are 400.
+  - `statusFor` uses `errors.Is`: `ErrNotFound` → 404, anything else → 500
+    with a generic message, so internal details never reach the client.
+- **`routes.go`:** `GET /api/product` and `GET /api/product/{productId}`;
+  other methods on those paths get a JSON 405.
+- **Wiring:**
+  - `httpapi.NewRouter(logger, registrars ...Registrar)`. `Registrar` is an
+    interface declared in `httpapi`, so `httpapi` doesn't import any domain
+    package.
+  - `app.New` builds MemoryStore → Service → Handler and passes the handler
+    to the router.
+  - The 405 helper moved from `httpapi` to `httpx.MethodNotAllowed` so
+    domain routes can use it.
+- Removed the empty boilerplate `internal/product/store.go`, which was
+  replaced by the `Store` interface in `service.go` and by
+  `store_memory.go`.
+
+**Spec mapping:** the spec paths `/product` and `/product/{productId}` sit
+under the server base `/api`. `id` is a JSON string, `price` a number, and
+the path parameter an int64, hence the 400 for anything else. The spec gives
+no body for 400 and 404, so both use the `APIError` shape.
+
+**Files:** `internal/product/{product,service,store_memory,seed,http_types,handler,routes}.go`,
+`service_test.go`, `handler_test.go` (new), `internal/httpapi/router.go`,
+`internal/httpx/response.go`, `internal/app/app.go`, `app_test.go`.
+
+**Results**
+- `go build`, `go vet` and `go test -race` pass.
+- **Service tests** (fake Store): `List` with products, empty, and a store
+  error; `Get` found, not found (still `ErrNotFound` after wrapping), and a
+  store error. Each checks the ID passed to the store.
+- **Store and seed tests:** numeric-first sort order, `Get` and not found, an
+  empty store returning `[]`, and seed data that is 5-10 items with unique,
+  valid IDs and complete fields.
+- **Handler tests** (httptest):
+  - List returns an exact JSON body (6.5 / 5.5 / 12.99), `[]` for both an
+    empty store and a store returning a nil slice, and 500 without leaking
+    the error.
+  - Get: 200 for 1, 10 and 0001; 404 for 999 and max int64; 400 for abc, 0,
+    -1, +1, 1.5, int64 overflow and a space.
+  - Also a 500 on store failure, a 405 with `Allow`, `statusFor` including a
+    wrapped error, and the cents conversion.
+- **App test:** `/api/product/1` is reachable through `app.New`.
+- **Smoke test of the binary:** list 200 (9 items), `/3` 200, `/999` 404,
+  `/abc` 400, `DELETE` 405.
+
+---
+
 ## Open items
 
-- API plumbing is in place (`cmd/api` serves `/healthz`). Next: product and
-  order handlers per `api/openapi.yaml`, with coupon validation through
+- Product API done (`GET /api/product`, `GET /api/product/{productId}`). Next:
+  `POST /api/order` per `api/openapi.yaml` (api_key auth), with coupon
+  validation through
   `coupon.NewService(coupon.NewStore(pool)).Validate`. The API also needs
   `DATABASE_URL` added to its config for that.
 - Still planned: `scripts/stats.sql` + `make stats`, `make verify`, and an

@@ -10,6 +10,7 @@ import (
 
 	"shop/internal/config"
 	"shop/internal/httpapi"
+	"shop/internal/product"
 )
 
 type App struct {
@@ -37,9 +38,11 @@ func newApp(cfg config.Config, out io.Writer) (*App, error) {
 	}
 	logger := slog.New(h).With("env", cfg.Env)
 
+	products := product.NewHandler(product.NewService(product.NewMemoryStore(product.SeedProducts())))
+
 	return &App{
 		Config:  cfg,
 		Logger:  logger,
-		Handler: httpapi.NewRouter(logger),
+		Handler: httpapi.NewRouter(logger, products),
 	}, nil
 }

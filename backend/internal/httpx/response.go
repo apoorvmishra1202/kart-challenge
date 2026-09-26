@@ -36,6 +36,16 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// MethodNotAllowed returns a handler that answers 405 with an APIError and
+// the given Allow header. Register it on a method-less pattern next to the
+// method-specific ones, which take precedence.
+func MethodNotAllowed(allow string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", allow)
+		WriteError(w, http.StatusMethodNotAllowed, TypeMethodNotAllowed, "method not allowed")
+	})
+}
+
 // WriteError writes an APIError. A status below 400 is a programming error,
 // so it is replaced with 500 rather than sending an error body with a success
 // code.
