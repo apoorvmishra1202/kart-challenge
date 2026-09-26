@@ -43,6 +43,8 @@ func TestAPIKey(t *testing.T) {
 		{"key prefix", map[string]string{"api_key": "apites"}, http.StatusForbidden, httpx.TypeForbidden},
 		{"key with suffix", map[string]string{"api_key": "apitest2"}, http.StatusForbidden, httpx.TypeForbidden},
 		{"key wrong case", map[string]string{"api_key": "APITEST"}, http.StatusForbidden, httpx.TypeForbidden},
+		{"much longer key", map[string]string{"api_key": strings.Repeat("apitest", 50)}, http.StatusForbidden, httpx.TypeForbidden},
+		{"single character", map[string]string{"api_key": "a"}, http.StatusForbidden, httpx.TypeForbidden},
 		{"other auth header only", map[string]string{"Authorization": "apitest"}, http.StatusUnauthorized, httpx.TypeUnauthorized},
 	}
 	for _, tt := range tests {

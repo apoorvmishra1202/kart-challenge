@@ -3,6 +3,7 @@ package order
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -147,9 +148,11 @@ func TestHandlerPlaceErrors(t *testing.T) {
 		{"quantity 101", `{"items":[{"productId":"1","quantity":101}]}`, nil, http.StatusUnprocessableEntity, httpx.TypeUnprocessable, "between 1 and 100"},
 		{"all item errors reported", `{"items":[{"quantity":0},{"productId":"2","quantity":500}]}`, nil,
 			http.StatusUnprocessableEntity, httpx.TypeUnprocessable, "items[1].quantity"},
-		{"unknown product", `{"items":[{"productId":"99","quantity":1}]}`, nil, http.StatusUnprocessableEntity, httpx.TypeUnprocessable, "unknown product"},
+		{"unknown product", `{"items":[{"productId":"99","quantity":1}]}`, nil, http.StatusUnprocessableEntity, httpx.TypeUnprocessable, `unknown product: "99"`},
 		{"invalid coupon", `{"couponCode":"NOPE1234","items":[{"productId":"1","quantity":1}]}`, nil,
-			http.StatusUnprocessableEntity, httpx.TypeUnprocessable, "invalid coupon"},
+			http.StatusUnprocessableEntity, httpx.TypeUnprocessable, `invalid coupon: "NOPE1234"`},
+		{"merged quantity over 100", `{"items":[{"productId":"1","quantity":60},{"productId":"1","quantity":41}]}`, nil,
+			http.StatusUnprocessableEntity, httpx.TypeUnprocessable, `total quantity per product must not exceed 100: "1"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -227,4 +230,28 @@ func keys(m map[string]json.RawMessage) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func TestClientMessage(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"input error", &InputError{Err: ErrUnknownProduct, Value: "99"}, `unknown product: "99"`},
+		{"wrapping context is not leaked",
+			fmt.Errorf("tx 42 on db-primary: %w", &InputError{Err: ErrInvalidCoupon, Value: "NOPE1234"}),
+			`invalid coupon: "NOPE1234"`},
+		{"bare sentinel", fmt.Errorf("internal detail: %w", ErrQuantityLimit), ErrQuantityLimit.Error()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clientMessage(tt.err); got != tt.want {
+				t.Errorf("clientMessage = %q, want %q", got, tt.want)
+			}
+			if statusFor(tt.err) != http.StatusUnprocessableEntity {
+				t.Errorf("statusFor = %d, want 422", statusFor(tt.err))
+			}
+		})
+	}
 }

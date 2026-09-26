@@ -36,18 +36,25 @@ func NewService(store Store, products ProductLookup, coupons CouponValidator) *S
 	return &Service{store: store, products: products, coupons: coupons}
 }
 
-// Place merges duplicate product IDs, resolves every product, validates the
-// coupon if one is given, and saves the order under a new UUIDv4 ID. Errors
-// wrap ErrUnknownProduct or ErrInvalidCoupon when the input is at fault.
-// Items are assumed to be validated by the caller (see PlaceOrderRequest).
+// Place merges duplicate product IDs, checks each product's total quantity,
+// resolves every product, validates the coupon if one is given, and saves the
+// order under a new UUIDv4 ID. When the input is at fault the error is an
+// *InputError wrapping ErrQuantityLimit, ErrUnknownProduct or
+// ErrInvalidCoupon. Request lines are assumed to be validated by the caller
+// (see PlaceOrderRequest).
 func (s *Service) Place(ctx context.Context, items []Item, couponCode string) (Order, error) {
 	merged := mergeItems(items)
+	for _, it := range merged {
+		if it.Quantity > MaxQuantity {
+			return Order{}, &InputError{Err: ErrQuantityLimit, Value: it.ProductID}
+		}
+	}
 
 	products := make([]product.Product, 0, len(merged))
 	for _, it := range merged {
 		p, err := s.products.Get(ctx, it.ProductID)
 		if errors.Is(err, product.ErrNotFound) {
-			return Order{}, fmt.Errorf("%w: %q", ErrUnknownProduct, it.ProductID)
+			return Order{}, &InputError{Err: ErrUnknownProduct, Value: it.ProductID}
 		}
 		if err != nil {
 			return Order{}, fmt.Errorf("look up product %q: %w", it.ProductID, err)
@@ -61,7 +68,7 @@ func (s *Service) Place(ctx context.Context, items []Item, couponCode string) (O
 			return Order{}, fmt.Errorf("validate coupon: %w", err)
 		}
 		if !ok {
-			return Order{}, fmt.Errorf("%w: %q", ErrInvalidCoupon, couponCode)
+			return Order{}, &InputError{Err: ErrInvalidCoupon, Value: couponCode}
 		}
 	}
 

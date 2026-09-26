@@ -4,6 +4,7 @@ package httpapi
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"log/slog"
@@ -155,8 +156,11 @@ func Recover(logger *slog.Logger) Middleware {
 }
 
 // APIKey requires the api_key header: 401 when it is missing or empty, 403
-// when it doesn't match. The comparison is constant-time.
+// when it doesn't match. Both keys are hashed with SHA-256 before a
+// constant-time comparison, so neither the key's content nor its length leaks
+// through response timing.
 func APIKey(key string) Middleware {
+	want := sha256.Sum256([]byte(key))
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			got := r.Header.Get("api_key")
@@ -164,7 +168,8 @@ func APIKey(key string) Middleware {
 				httpx.WriteError(w, http.StatusUnauthorized, httpx.TypeUnauthorized, "missing api_key header")
 				return
 			}
-			if subtle.ConstantTimeCompare([]byte(got), []byte(key)) != 1 {
+			gotSum := sha256.Sum256([]byte(got))
+			if subtle.ConstantTimeCompare(gotSum[:], want[:]) != 1 {
 				httpx.WriteError(w, http.StatusForbidden, httpx.TypeForbidden, "invalid api_key")
 				return
 			}

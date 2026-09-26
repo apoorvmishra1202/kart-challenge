@@ -7,11 +7,6 @@ import (
 	"shop/internal/product"
 )
 
-const (
-	minQuantity = 1
-	maxQuantity = 100
-)
-
 // PlaceOrderRequest is the OrderReq schema in api/openapi.yaml.
 type PlaceOrderRequest struct {
 	CouponCode string        `json:"couponCode"`
@@ -34,8 +29,8 @@ func (r PlaceOrderRequest) Validate() error {
 		if it.ProductID == "" {
 			errs = append(errs, fmt.Errorf("items[%d].productId is required", i))
 		}
-		if it.Quantity < minQuantity || it.Quantity > maxQuantity {
-			errs = append(errs, fmt.Errorf("items[%d].quantity must be between %d and %d", i, minQuantity, maxQuantity))
+		if it.Quantity < MinQuantity || it.Quantity > MaxQuantity {
+			errs = append(errs, fmt.Errorf("items[%d].quantity must be between %d and %d", i, MinQuantity, MaxQuantity))
 		}
 	}
 	return errors.Join(errs...)
@@ -44,7 +39,7 @@ func (r PlaceOrderRequest) Validate() error {
 func (r PlaceOrderRequest) toItems() []Item {
 	items := make([]Item, len(r.Items))
 	for i, it := range r.Items {
-		items[i] = Item{ProductID: it.ProductID, Quantity: it.Quantity}
+		items[i] = Item(it)
 	}
 	return items
 }
@@ -63,7 +58,7 @@ func toOrderResponse(o Order) OrderResponse {
 		Products: make([]product.ProductResponse, len(o.Products)),
 	}
 	for i, it := range o.Items {
-		resp.Items[i] = ItemRequest{ProductID: it.ProductID, Quantity: it.Quantity}
+		resp.Items[i] = ItemRequest(it)
 	}
 	for i, p := range o.Products {
 		resp.Products[i] = product.ToResponse(p)

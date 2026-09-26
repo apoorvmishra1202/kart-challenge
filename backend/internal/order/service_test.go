@@ -96,6 +96,24 @@ func TestServicePlace(t *testing.T) {
 			wantProducts: []product.Product{tiramisu, waffle},
 		},
 		{
+			name:         "merged total of exactly 100 is allowed",
+			items:        []Item{{"1", 60}, {"1", 40}},
+			products:     &fakeProducts{byID: catalog},
+			coupons:      &fakeCoupons{},
+			store:        &fakeStore{},
+			wantItems:    []Item{{"1", 100}},
+			wantProducts: []product.Product{waffle},
+		},
+		{
+			name:       "merged total over 100",
+			items:      []Item{{"1", 60}, {"2", 1}, {"1", 60}},
+			products:   &fakeProducts{byID: catalog},
+			coupons:    &fakeCoupons{},
+			store:      &fakeStore{},
+			wantErrIs:  ErrQuantityLimit,
+			wantErrNot: []error{ErrUnknownProduct, ErrInvalidCoupon},
+		},
+		{
 			name:         "valid coupon",
 			items:        []Item{{"1", 1}},
 			coupon:       "HAPPYHRS",
@@ -238,5 +256,32 @@ func TestMemoryStore(t *testing.T) {
 	}
 	if err := s.Save(context.Background(), Order{ID: "a"}); err == nil {
 		t.Error("saving a duplicate ID succeeded")
+	}
+}
+
+func TestPlaceInputErrorCarriesValue(t *testing.T) {
+	tests := []struct {
+		name      string
+		items     []Item
+		coupon    string
+		wantErr   error
+		wantValue string
+	}{
+		{"unknown product", []Item{{"1", 1}, {"99", 1}}, "", ErrUnknownProduct, "99"},
+		{"invalid coupon", []Item{{"1", 1}}, "NOPE1234", ErrInvalidCoupon, "NOPE1234"},
+		{"quantity limit", []Item{{"2", 70}, {"2", 31}}, "", ErrQuantityLimit, "2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := NewService(&fakeStore{}, &fakeProducts{byID: catalog}, &fakeCoupons{})
+			_, err := svc.Place(context.Background(), tt.items, tt.coupon)
+			var ie *InputError
+			if !errors.As(err, &ie) {
+				t.Fatalf("err = %v (%T), want *InputError", err, err)
+			}
+			if ie.Err != tt.wantErr || ie.Value != tt.wantValue {
+				t.Errorf("InputError = {%v, %q}, want {%v, %q}", ie.Err, ie.Value, tt.wantErr, tt.wantValue)
+			}
+		})
 	}
 }

@@ -858,9 +858,57 @@ with `Store.Exists`.
 
 ---
 
+## 2026-09-26: Review fixes 3/3: harden order and product handlers
+
+**What**
+- **S1:** `product.NewHandler(svc, logger)`. On a 500 the handler logs the
+  real error (`ErrorContext`, with the request context) before writing the
+  generic message; 404s aren't logged.
+- **S4:** `Place` checks each product's total after merging duplicates (at
+  most `MaxQuantity`, 100) and returns 422 `ErrQuantityLimit` if exceeded.
+  `MinQuantity` and `MaxQuantity` moved to `order.go` and are shared with
+  `PlaceOrderRequest.Validate`.
+- **S5:** new `order.InputError{Err, Value}`, where `Err` is the sentinel and
+  `Value` the offending productId or coupon code, with `Unwrap()` returning
+  the sentinel.
+  - `Place` returns it for an unknown product, an invalid coupon and the
+    quantity limit.
+  - The handler's `clientMessage` builds the 422 text as
+    `sentinel.Error() + ": " + quoted value`, never from `err.Error()` of the
+    chain.
+  - The 400 path uses `RequestError.Message` instead of `err.Error()`.
+  - `statusFor` checks one list of 422 sentinels.
+- **N1:** `Item(it)` and `ItemRequest(it)` conversions (staticcheck S1016).
+- **N4:** `APIKey` hashes the configured key once and each presented key per
+  request with SHA-256, then compares the digests with
+  `subtle.ConstantTimeCompare`. Equal-length digests mean response timing no
+  longer reveals the key's length.
+
+**Results**
+- gofmt clean; `go vet`, `go build` and `go test -race` pass. **staticcheck
+  is now clean** (the 2 S1016 findings are gone).
+- **New tests:**
+  - Service: a merged total of exactly 100 passes; 60 + 1 + 60 fails with
+    `ErrQuantityLimit` and nothing is saved.
+  - `InputError` carries the right sentinel and value for all three cases.
+  - Handler: a merged quantity over 100 returns 422
+    `total quantity per product must not exceed 100: "1"`; exact messages
+    for an unknown product (`"99"`) and an invalid coupon.
+  - `clientMessage` doesn't leak wrapping context
+    ("tx 42 on db-primary: …" becomes just `invalid coupon: "NOPE1234"`).
+  - Product: store failures on both routes are logged and not leaked, and a
+    404 isn't logged.
+  - `APIKey`: a much longer key and a single-character key both get 403.
+- No handler writes `err.Error()` of a service error to the client anymore.
+
+---
+
 ## Open items
 
-- Real coupons are wired into the API (done in review fix 2/3).
+- Review fixes 1-3 done (not pushed). Deferred from the review: S2 (move the
+  importer's SQL into a store), S6 (integration tests for the importer and
+  `coupon.Store`), N2 (unknown-field detection matches error text), N3
+  (in-memory order store grows forever).
 - Still planned: `scripts/stats.sql` + `make stats`, `make verify`, and an
   integration test.
 - `f1a2d1f`, `6f6b080` and the Docker-timing docs commit pushed to `dev` on 2026-09-26.

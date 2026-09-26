@@ -77,7 +77,7 @@ func newApp(cfg config.Config, out io.Writer, coupons coupon.CodeStore) (*App, e
 	couponSvc := coupon.NewService(coupons)
 	orderSvc := order.NewService(order.NewMemoryStore(), productSvc, couponSvc)
 
-	productHandler := product.NewHandler(productSvc)
+	productHandler := product.NewHandler(productSvc, logger)
 	orderHandler := order.NewHandler(orderSvc, logger)
 	protect := httpapi.APIKey(cfg.APIKey)
 

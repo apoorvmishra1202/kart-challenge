@@ -1,8 +1,10 @@
 package product
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,9 +14,15 @@ import (
 )
 
 func newTestMux(store Store) *http.ServeMux {
-	mux := http.NewServeMux()
-	NewHandler(NewService(store)).Register(mux)
+	mux, _ := newTestMuxWithLogs(store)
 	return mux
+}
+
+func newTestMuxWithLogs(store Store) (*http.ServeMux, *bytes.Buffer) {
+	var logs bytes.Buffer
+	mux := http.NewServeMux()
+	NewHandler(NewService(store), slog.New(slog.NewTextHandler(&logs, nil))).Register(mux)
+	return mux, &logs
 }
 
 func serve(mux *http.ServeMux, method, path string) *httptest.ResponseRecorder {
@@ -116,9 +124,26 @@ func TestHandlerGet(t *testing.T) {
 	}
 }
 
-func TestHandlerGetStoreFailure(t *testing.T) {
-	w := serve(newTestMux(&fakeStore{err: errDB}), http.MethodGet, "/api/product/1")
-	assertAPIError(t, w, http.StatusInternalServerError, httpx.TypeInternal)
+func TestHandlerStoreFailureIsLogged(t *testing.T) {
+	for _, path := range []string{"/api/product", "/api/product/1"} {
+		mux, logs := newTestMuxWithLogs(&fakeStore{err: errDB})
+		w := serve(mux, http.MethodGet, path)
+		assertAPIError(t, w, http.StatusInternalServerError, httpx.TypeInternal)
+		if strings.Contains(w.Body.String(), errDB.Error()) {
+			t.Errorf("%s: internal error leaked to client", path)
+		}
+		if !strings.Contains(logs.String(), errDB.Error()) {
+			t.Errorf("%s: real error not logged: %q", path, logs.String())
+		}
+	}
+}
+
+func TestHandlerNotFoundIsNotLogged(t *testing.T) {
+	mux, logs := newTestMuxWithLogs(NewMemoryStore(testCatalogue))
+	serve(mux, http.MethodGet, "/api/product/999")
+	if logs.Len() != 0 {
+		t.Errorf("a 404 should not log an error: %q", logs.String())
+	}
 }
 
 func TestHandlerWrongMethod(t *testing.T) {

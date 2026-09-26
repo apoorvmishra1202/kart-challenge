@@ -2,6 +2,7 @@ package product
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -10,17 +11,18 @@ import (
 
 type Handler struct {
 	svc *Service
+	log *slog.Logger
 }
 
-func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc}
+func NewHandler(svc *Service, log *slog.Logger) *Handler {
+	return &Handler{svc: svc, log: log}
 }
 
 // List serves GET /api/product. It always returns a JSON array, never null.
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	products, err := h.svc.List(r.Context())
 	if err != nil {
-		writeServiceError(w, err)
+		h.writeServiceError(w, r, err)
 		return
 	}
 	out := make([]ProductResponse, 0, len(products))
@@ -40,7 +42,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := h.svc.Get(r.Context(), id)
 	if err != nil {
-		writeServiceError(w, err)
+		h.writeServiceError(w, r, err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, ToResponse(p))
@@ -64,13 +66,14 @@ func parseProductID(raw string) (string, bool) {
 	return strconv.FormatInt(n, 10), true
 }
 
-func writeServiceError(w http.ResponseWriter, err error) {
+func (h *Handler) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	status := statusFor(err)
 	switch status {
 	case http.StatusNotFound:
 		httpx.WriteError(w, status, httpx.TypeNotFound, "product not found")
 	default:
-		// Don't leak internal details; the request log records the 500.
+		// Log the real error; the client only gets a generic message.
+		h.log.ErrorContext(r.Context(), "product request failed", "err", err)
 		httpx.WriteError(w, status, httpx.TypeInternal, "internal server error")
 	}
 }
