@@ -406,8 +406,7 @@ the same 8 codes as `valid_codes`: `BIRTHDAY`, `BUYGETON`, `FIFTYOFF`,
 
 ## 2026-09-26: Experiment committed
 
-Commit `f1a2d1f feat(backend): experimental "valid" import mode` on `dev`
-(local; not pushed at the time of writing).
+Commit `f1a2d1f feat(backend): experimental "valid" import mode` on `dev`.
 
 ---
 
@@ -477,14 +476,46 @@ old design (changing the rule without a re-import) is now covered by
 
 ---
 
+## 2026-09-26: Final design verified on the full data in Docker
+
+**What:** Ran `docker compose down -v`, then
+`docker compose up --build importer`: a fresh volume, with the importer
+running inside Docker.
+
+**Results**
+
+| Step | Native (earlier run) | Docker |
+|---|---|---|
+| Read+encode per file | 15-16.5s | 21-24s |
+| Sort+dedupe per file | 11-12.5s | 19-22s |
+| Merge | 3.2s | 4.2s |
+| COPY | 29 ms | 67 ms |
+| **Total** | **32s** | **50.3s** |
+| Peak heap / Sys | 2,653 MiB / 2,667 MiB | 2,653 MiB / 2,666 MiB |
+
+- `import_status`: one row (`valid_codes`, 8 rows, `load_ms=50253`,
+  `min_files=2`). There's no `coupon_codes` table.
+- `valid_codes`: the same 8 codes as before. Database size is 7.6 MB, mostly
+  Postgres system catalogs, and the `pgdata` volume is 48 MB (it was about
+  22 GB).
+- Docker's disk file on the Mac shrank from 31 GB to 14 GB.
+- It fit in Docker Desktop's 3.8 GiB VM (peak ~2.6 GiB plus Postgres), but
+  with little headroom. The README keeps the 4 GB requirement.
+
+**Notes**
+- Docker is about 1.6× slower than running natively, in both reading and
+  sorting. The likely causes are the VM's CPU and memory overhead and reading
+  the bind-mounted `./data` files through the VM's file sharing.
+- The README now says about 50s in Docker and 32s natively.
+- The "dropped legacy coupon_codes" path wasn't exercised here, because the
+  volume was fresh. It was tested on the throwaway database.
+
+---
+
 ## Open items
 
-- Verify end to end on the real volume: the importer should drop
-  `coupon_codes`, the Docker disk usage should shrink, and `valid_codes`
-  should hold 8 codes.
-- Docker Desktop's VM has 3.8 GiB; the README requires 4 GB or more. Raise it
-  before running the importer in Docker, or run it natively with `go run`.
 - `cmd/api` is still an empty stub; the `api` container exits immediately.
   The next step is to wire up `coupon.NewService(coupon.NewStore(pool)).Validate`.
 - Still planned: `scripts/stats.sql` + `make stats`, `make verify`, and an
   integration test.
+- `f1a2d1f`, `6f6b080` and the Docker-timing docs commit pushed to `dev` on 2026-09-26.

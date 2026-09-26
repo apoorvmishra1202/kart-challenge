@@ -22,7 +22,7 @@ docker compose up --build
 ```
 
 The `importer` service computes the valid codes, writes them to `valid_codes`,
-and exits (about 30 seconds on the full data). `api` starts only after the
+and exits (about 50 seconds in Docker, 32 seconds natively, on the full data). `api` starts only after the
 import completes successfully. Later starts skip the import.
 
 To try the sample files, run the importer against the compose database:
@@ -81,7 +81,7 @@ approaches were measured on the full data, on the same machine:
 
 | | Store all rows, check at query time | **Store valid codes only (current)** |
 |---|---|---|
-| Import time | 15m15s (first version), 8m10s (optimized) | **32s** |
+| Import time | 15m15s (first version), 8m10s (optimized) | **32s** natively, 50s in Docker |
 | Stages | load 59s, index build 6m06s, VACUUM 1m04s | read + sort + merge 32.0s, COPY 29 ms |
 | Rows stored | 313,087,705 | **8** |
 | Disk (table + index) | 13 GB + 9.4 GB | **8 kB + 16 kB** |
