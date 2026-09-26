@@ -151,10 +151,119 @@ docker compose up --build importer
 
 ---
 
+## 2026-09-26: Importer v1 committed and pushed
+
+Commit `ff0514b feat(backend): coupon code importer v1` on `dev`, containing
+everything above. `.DS_Store` was added to `backend/.gitignore`.
+
+---
+
+## 2026-09-26: Importer optimization
+
+**What**
+- **Byte-order collation:** the column is now `code TEXT COLLATE "C" NOT NULL`,
+  in both the importer schema and `migrations/001_create_coupon_tables.sql`.
+  - On startup the importer checks the collation of `coupon_codes.code`
+    (`pg_attribute` joined with `pg_collation`). If the table exists without
+    `"C"`, it logs a warning, drops the table, and deletes the `import_status`
+    row, so an old v1 volume is rebuilt automatically.
+- **Faster index build:** on the single index connection it runs
+  `SET maintenance_work_mem` and `SET max_parallel_maintenance_workers`, then
+  `RESET`s both afterwards.
+  - Values come from env `IMPORT_MAINTENANCE_WORK_MEM` (default `1GB`) and
+    `IMPORT_PARALLEL_WORKERS` (default `4`), also set in `docker-compose.yml`.
+  - Both are interpolated into SQL, so `coupon.ParseIndexOptions` validates
+    them first. Memory must match `^[0-9]+(kB|MB|GB)$`; workers must be an
+    integer from 0 to 16. The importer fails before connecting otherwise.
+- **Index-only scans:** `ANALYZE` was replaced with `VACUUM (ANALYZE)` after
+  the index build, as a plain `Exec` since VACUUM can't run in a transaction.
+- **Phase timings:** the importer logs load (per file and total), index build,
+  vacuum/analyze, and total durations, then table and index sizes.
+  - `import_status` gained `load_ms`, `index_ms` and `vacuum_ms` columns via
+    `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
+- `NewImporter` now takes an `IndexOptions` argument.
+
+**Why**
+- **"C" collation:** codes are ASCII uppercase letters and digits, so byte
+  order sorts them correctly. The default linguistic collation makes every
+  comparison in the index sort, and every lookup, more expensive.
+- **More memory and parallel workers:** the index build was 85% of import
+  time (12m57s of 15m15s).
+- **VACUUM:** it sets the visibility map. Without it, index-only scans may
+  still fetch table rows until autovacuum happens to run.
+
+**Files:** `internal/coupon/import.go`, `internal/coupon/import_test.go` (new),
+`cmd/importer/main.go`, `migrations/001_create_coupon_tables.sql`,
+`docker-compose.yml`.
+
+**Results (throwaway Postgres on :5433, sample data)**
+- `go build`, `go vet` and `go test` pass. The new table test covers valid
+  values, out-of-range workers, missing or lowercase units, and SQL-injection
+  strings.
+- **Old schema detected:** with a v1 table (default collation) and status row
+  already present, the importer logged `collation=default`, dropped the table,
+  and re-imported 12 rows. The old row was gone.
+- The rebuilt column reports `collation_name = C`. The status row has
+  `load_ms`, `index_ms` and `vacuum_ms` filled in.
+- A second run skipped the import.
+- A bad `IMPORT_MAINTENANCE_WORK_MEM` or `IMPORT_PARALLEL_WORKERS=99` exits 1
+  with a clear message.
+- A lookup is an index-only scan with `Heap Fetches: 0`.
+- Full-data results are in the next entry.
+
+**Notes:** Migration 001 was edited in place rather than adding a new
+migration file. There is no migration runner; the importer creates the schema
+itself.
+
+---
+
+## 2026-09-26: Optimized full import verified
+
+**What:** Ran `docker compose down -v`, then `docker compose up --build`.
+- The first attempt was cut off when Docker Desktop was quit from its app
+  during the index build (the Docker log shows `POST /app/quit`, a clean
+  shutdown, not a crash). The importer exited with code 1.
+- It was resumed with `docker compose up importer` on the same volume. There
+  was no status row, so the importer truncated the partial table and reloaded
+  it. The final count is exactly 313,087,705, so partial-run cleanup works on
+  real data.
+
+**Results (v1 → optimized)**
+
+| Phase | v1 | Optimized |
+|---|---|---|
+| Load (3 files in parallel) | 2m18s | 59s |
+| Index build | 12m57s | 6m06s |
+| VACUUM (ANALYZE) | – (plain ANALYZE, not timed) | 1m04s |
+| **Total** | **15m15s** | **8m10s** |
+| Table size | 13 GB | 13 GB |
+| Index size | 9.4 GB | 9.4 GB (9418 MB) |
+| Cold lookup (index-only scan) | 1.45 ms | 2.9 ms, `Heap Fetches: 0` |
+
+- `import_status`: `load_ms=58885`, `index_ms=366465`, `vacuum_ms=64148`.
+  The column's `collation_name` is `C`.
+- Lookups: `HAPPYHRS` 2, `FIFTYOFF` 3, `SUPER100` 1, the same as v1.
+
+**Notes**
+- **Index build (2.1× faster)** is the direct result of the "C" collation,
+  1 GB `maintenance_work_mem`, and 4 parallel workers.
+- **Load time** varied from run to run (2m18s in v1, 1m33s on the interrupted
+  run, 59s here) even though the load code barely changed. The likely cause is
+  the OS file cache and less competition for the machine, so it isn't claimed
+  as an optimization win.
+- **Cold lookup timings** of 1–3 ms are single cold reads of 4–6 buffers and
+  are noise at this scale. What matters is that the plan is an index-only scan
+  with 0 heap fetches.
+- **Disk and laptop:** Docker's disk file is about 31 GB and the Mac had 24 GB
+  free. Loading and indexing make the laptop sluggish, so after measuring we
+  stop the containers (`docker compose stop`) and quit Docker Desktop. The
+  data stays in the `pgdata` volume.
+
+---
+
 ## Open items
 
 - `cmd/api` is still an empty stub; the `api` container exits immediately.
   The next step is to wire up `coupon.NewService(coupon.NewStore(pool)).Validate`.
-- Importer v1 (everything above) committed and pushed to `dev` on
-  2026-09-26. Next: optimization pass (C collation, parallel index build,
-  VACUUM for index-only scans, phase timings, stats and verify tooling).
+- Still planned: `scripts/stats.sql` + `make stats`, `make verify`, an
+  integration test, and the README Performance and Requirements sections.

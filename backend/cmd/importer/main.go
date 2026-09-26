@@ -38,6 +38,11 @@ func run(log *slog.Logger) error {
 		}
 	}
 
+	indexOpts, err := coupon.ParseIndexOptions(os.Getenv("IMPORT_MAINTENANCE_WORK_MEM"), os.Getenv("IMPORT_PARALLEL_WORKERS"))
+	if err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -47,5 +52,5 @@ func run(log *slog.Logger) error {
 	}
 	defer pool.Close()
 
-	return coupon.NewImporter(pool, log).Run(ctx, files)
+	return coupon.NewImporter(pool, log, indexOpts).Run(ctx, files)
 }

@@ -1,7 +1,9 @@
 -- Coupon codes are derived from the source files and can always be rebuilt,
 -- so the table is UNLOGGED (no WAL; emptied by Postgres after a crash).
+-- Codes are ASCII uppercase letters and digits, so byte-order collation ("C")
+-- sorts them correctly and makes comparisons and index builds much faster.
 CREATE UNLOGGED TABLE IF NOT EXISTS coupon_codes (
-    code    TEXT     NOT NULL,
+    code    TEXT COLLATE "C" NOT NULL,
     file_id SMALLINT NOT NULL
 );
 
@@ -10,6 +12,12 @@ CREATE TABLE IF NOT EXISTS import_status (
     row_count    BIGINT NOT NULL,
     completed_at TIMESTAMPTZ NOT NULL
 );
+
+-- Phase timings, added after the first version; ADD COLUMN IF NOT EXISTS
+-- migrates existing databases.
+ALTER TABLE import_status ADD COLUMN IF NOT EXISTS load_ms   BIGINT;
+ALTER TABLE import_status ADD COLUMN IF NOT EXISTS index_ms  BIGINT;
+ALTER TABLE import_status ADD COLUMN IF NOT EXISTS vacuum_ms BIGINT;
 
 -- The importer drops this before loading and recreates it afterwards, since
 -- building an index once is much faster than maintaining it during COPY.

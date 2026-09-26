@@ -2,10 +2,13 @@ package coupon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -17,38 +20,93 @@ import (
 
 const statusName = "coupon_codes"
 
-// Kept in sync with migrations/001_create_coupon_tables.sql.
-var schema = []string{
-	`CREATE UNLOGGED TABLE IF NOT EXISTS coupon_codes (
-		code    TEXT     NOT NULL,
-		file_id SMALLINT NOT NULL
-	)`,
+// Kept in sync with migrations/001_create_coupon_tables.sql. coupon_codes is
+// created separately, after ensureByteOrderCollation has run.
+var statusSchema = []string{
 	`CREATE TABLE IF NOT EXISTS import_status (
 		name         TEXT PRIMARY KEY,
 		row_count    BIGINT NOT NULL,
 		completed_at TIMESTAMPTZ NOT NULL
 	)`,
+	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS load_ms   BIGINT`,
+	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS index_ms  BIGINT`,
+	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS vacuum_ms BIGINT`,
+}
+
+// Codes are ASCII uppercase letters and digits, so byte order ("C") sorts
+// them correctly and is much cheaper than a linguistic collation.
+const codesSchema = `CREATE UNLOGGED TABLE IF NOT EXISTS coupon_codes (
+	code    TEXT COLLATE "C" NOT NULL,
+	file_id SMALLINT NOT NULL
+)`
+
+const (
+	DefaultMaintenanceWorkMem = "1GB"
+	DefaultParallelWorkers    = 4
+	maxParallelWorkers        = 16
+)
+
+var workMemPattern = regexp.MustCompile(`^[0-9]+(kB|MB|GB)$`)
+
+// IndexOptions tune the index build. The values are interpolated into SET
+// statements (which cannot take bind parameters), so they must be validated.
+type IndexOptions struct {
+	MaintenanceWorkMem string
+	ParallelWorkers    int
+}
+
+// ParseIndexOptions builds IndexOptions from raw env values; empty strings
+// select the defaults.
+func ParseIndexOptions(workMem, workers string) (IndexOptions, error) {
+	opts := IndexOptions{MaintenanceWorkMem: DefaultMaintenanceWorkMem, ParallelWorkers: DefaultParallelWorkers}
+	if workMem != "" {
+		opts.MaintenanceWorkMem = workMem
+	}
+	if workers != "" {
+		n, err := strconv.Atoi(workers)
+		if err != nil {
+			return IndexOptions{}, fmt.Errorf("IMPORT_PARALLEL_WORKERS must be an integer from 0 to %d, got %q", maxParallelWorkers, workers)
+		}
+		opts.ParallelWorkers = n
+	}
+	return opts, opts.Validate()
+}
+
+func (o IndexOptions) Validate() error {
+	if !workMemPattern.MatchString(o.MaintenanceWorkMem) {
+		return fmt.Errorf("IMPORT_MAINTENANCE_WORK_MEM must look like 512MB or 1GB (units kB, MB, GB), got %q", o.MaintenanceWorkMem)
+	}
+	if o.ParallelWorkers < 0 || o.ParallelWorkers > maxParallelWorkers {
+		return fmt.Errorf("IMPORT_PARALLEL_WORKERS must be an integer from 0 to %d, got %d", maxParallelWorkers, o.ParallelWorkers)
+	}
+	return nil
 }
 
 // Importer loads the coupon source files into coupon_codes.
 type Importer struct {
 	pool *pgxpool.Pool
 	log  *slog.Logger
+	opts IndexOptions
 }
 
-func NewImporter(pool *pgxpool.Pool, log *slog.Logger) *Importer {
-	return &Importer{pool: pool, log: log}
+func NewImporter(pool *pgxpool.Pool, log *slog.Logger, opts IndexOptions) *Importer {
+	return &Importer{pool: pool, log: log, opts: opts}
+}
+
+type phaseTimings struct {
+	load, index, vacuum time.Duration
 }
 
 // Run imports files concurrently, assigning file_id 1..n in order. It is a
 // no-op when a previous import completed and its data is still present.
 func (im *Importer) Run(ctx context.Context, files []string) error {
+	if err := im.opts.Validate(); err != nil {
+		return err
+	}
 	start := time.Now()
 
-	for _, stmt := range schema {
-		if _, err := im.pool.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("create schema: %w", err)
-		}
+	if err := im.ensureSchema(ctx); err != nil {
+		return err
 	}
 
 	done, err := im.alreadyImported(ctx)
@@ -64,6 +122,8 @@ func (im *Importer) Run(ctx context.Context, files []string) error {
 		return err
 	}
 
+	var t phaseTimings
+	loadStart := time.Now()
 	counts := make([]int64, len(files))
 	g, gctx := errgroup.WithContext(ctx)
 	for i, path := range files {
@@ -76,25 +136,82 @@ func (im *Importer) Run(ctx context.Context, files []string) error {
 	if err := g.Wait(); err != nil {
 		return err
 	}
+	t.load = time.Since(loadStart)
 
 	var total int64
 	for _, n := range counts {
 		total += n
 	}
+	im.log.Info("load complete", "rows", total, "duration", t.load.Round(time.Millisecond))
 
-	if err := im.buildIndex(ctx); err != nil {
+	if t.index, t.vacuum, err = im.buildIndex(ctx); err != nil {
 		return err
 	}
 
 	_, err = im.pool.Exec(ctx,
-		`INSERT INTO import_status (name, row_count, completed_at) VALUES ($1, $2, now())
-		 ON CONFLICT (name) DO UPDATE SET row_count = EXCLUDED.row_count, completed_at = EXCLUDED.completed_at`,
-		statusName, total)
+		`INSERT INTO import_status (name, row_count, completed_at, load_ms, index_ms, vacuum_ms)
+		 VALUES ($1, $2, now(), $3, $4, $5)
+		 ON CONFLICT (name) DO UPDATE SET
+		   row_count = EXCLUDED.row_count, completed_at = EXCLUDED.completed_at,
+		   load_ms = EXCLUDED.load_ms, index_ms = EXCLUDED.index_ms, vacuum_ms = EXCLUDED.vacuum_ms`,
+		statusName, total, t.load.Milliseconds(), t.index.Milliseconds(), t.vacuum.Milliseconds())
 	if err != nil {
 		return fmt.Errorf("record import status: %w", err)
 	}
 
-	im.log.Info("import complete", "rows", total, "duration", time.Since(start).Round(time.Millisecond))
+	im.log.Info("import complete",
+		"rows", total,
+		"load", t.load.Round(time.Millisecond),
+		"index", t.index.Round(time.Millisecond),
+		"vacuum_analyze", t.vacuum.Round(time.Millisecond),
+		"total", time.Since(start).Round(time.Millisecond))
+	im.logSizes(ctx)
+	return nil
+}
+
+func (im *Importer) ensureSchema(ctx context.Context) error {
+	for _, stmt := range statusSchema {
+		if _, err := im.pool.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("create schema: %w", err)
+		}
+	}
+	if err := im.ensureByteOrderCollation(ctx); err != nil {
+		return err
+	}
+	if _, err := im.pool.Exec(ctx, codesSchema); err != nil {
+		return fmt.Errorf("create schema: %w", err)
+	}
+	return nil
+}
+
+// ensureByteOrderCollation drops a coupon_codes table left by an older schema
+// whose code column is not COLLATE "C", so an existing volume is rebuilt
+// instead of silently keeping the slower schema.
+func (im *Importer) ensureByteOrderCollation(ctx context.Context) error {
+	var collation string
+	err := im.pool.QueryRow(ctx,
+		`SELECT coalesce(c.collname, '')
+		   FROM pg_attribute a
+		   LEFT JOIN pg_collation c ON c.oid = a.attcollation
+		  WHERE a.attrelid = to_regclass('coupon_codes')
+		    AND a.attname = 'code' AND NOT a.attisdropped`).Scan(&collation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // table does not exist yet
+	}
+	if err != nil {
+		return fmt.Errorf("check coupon_codes collation: %w", err)
+	}
+	if collation == "C" {
+		return nil
+	}
+
+	im.log.Warn("coupon_codes uses a non-C collation, dropping it for a rebuild", "collation", collation)
+	if _, err := im.pool.Exec(ctx, `DROP TABLE coupon_codes`); err != nil {
+		return fmt.Errorf("drop old coupon_codes: %w", err)
+	}
+	if _, err := im.pool.Exec(ctx, `DELETE FROM import_status WHERE name = $1`, statusName); err != nil {
+		return fmt.Errorf("clear import status: %w", err)
+	}
 	return nil
 }
 
@@ -154,28 +271,62 @@ func (im *Importer) loadFile(ctx context.Context, path string, fileID int16) (in
 	return n, nil
 }
 
-// buildIndex runs on a single connection so the SET applies to CREATE INDEX.
-func (im *Importer) buildIndex(ctx context.Context) error {
-	start := time.Now()
-	im.log.Info("building index", "index", "idx_coupon_code_file")
-
+// buildIndex runs on a single connection so the SET values apply to CREATE
+// INDEX and VACUUM. VACUUM sets the visibility map, which is what lets lookups
+// use index-only scans without heap fetches; it cannot run in a transaction,
+// so it is a plain Exec.
+func (im *Importer) buildIndex(ctx context.Context) (indexDur, vacuumDur time.Duration, err error) {
 	conn, err := im.pool.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire connection: %w", err)
+		return 0, 0, fmt.Errorf("acquire connection: %w", err)
 	}
 	defer conn.Release()
 
-	for _, stmt := range []string{
-		`SET maintenance_work_mem = '512MB'`,
-		`CREATE INDEX idx_coupon_code_file ON coupon_codes (code, file_id)`,
-		`ANALYZE coupon_codes`,
-		`RESET maintenance_work_mem`,
-	} {
+	// Values were validated by IndexOptions.Validate.
+	settings := []string{
+		fmt.Sprintf(`SET maintenance_work_mem = '%s'`, im.opts.MaintenanceWorkMem),
+		fmt.Sprintf(`SET max_parallel_maintenance_workers = %d`, im.opts.ParallelWorkers),
+	}
+	for _, stmt := range settings {
 		if _, err := conn.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("build index: %w", err)
+			return 0, 0, fmt.Errorf("configure index build: %w", err)
 		}
 	}
 
-	im.log.Info("index built", "duration", time.Since(start).Round(time.Millisecond))
-	return nil
+	im.log.Info("building index", "index", "idx_coupon_code_file",
+		"maintenance_work_mem", im.opts.MaintenanceWorkMem, "parallel_workers", im.opts.ParallelWorkers)
+	start := time.Now()
+	if _, err := conn.Exec(ctx, `CREATE INDEX idx_coupon_code_file ON coupon_codes (code, file_id)`); err != nil {
+		return 0, 0, fmt.Errorf("create index: %w", err)
+	}
+	indexDur = time.Since(start)
+	im.log.Info("index built", "duration", indexDur.Round(time.Millisecond))
+
+	im.log.Info("vacuum analyze", "table", "coupon_codes")
+	start = time.Now()
+	if _, err := conn.Exec(ctx, `VACUUM (ANALYZE) coupon_codes`); err != nil {
+		return indexDur, 0, fmt.Errorf("vacuum analyze: %w", err)
+	}
+	vacuumDur = time.Since(start)
+	im.log.Info("vacuum analyze done", "duration", vacuumDur.Round(time.Millisecond))
+
+	for _, stmt := range []string{`RESET maintenance_work_mem`, `RESET max_parallel_maintenance_workers`} {
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			return indexDur, vacuumDur, fmt.Errorf("reset settings: %w", err)
+		}
+	}
+	return indexDur, vacuumDur, nil
+}
+
+// logSizes is informational only, so a failure is logged, not returned.
+func (im *Importer) logSizes(ctx context.Context) {
+	var table, index string
+	err := im.pool.QueryRow(ctx,
+		`SELECT pg_size_pretty(pg_relation_size('coupon_codes')),
+		        pg_size_pretty(pg_relation_size('idx_coupon_code_file'))`).Scan(&table, &index)
+	if err != nil {
+		im.log.Warn("could not read relation sizes", "err", err)
+		return
+	}
+	im.log.Info("storage", "table_size", table, "index_size", index)
 }

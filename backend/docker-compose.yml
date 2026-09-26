@@ -21,6 +21,8 @@ services:
     environment:
       DATABASE_URL: postgres://shop:shop@db:5432/shop?sslmode=disable
       DATA_DIR: /data
+      IMPORT_MAINTENANCE_WORK_MEM: 1GB
+      IMPORT_PARALLEL_WORKERS: "4"
     volumes:
       - ./data:/data:ro
     depends_on:
