@@ -903,9 +903,65 @@ with `Store.Exists`.
 
 ---
 
+## 2026-09-26: Review fixes verified by the user on the real stack
+
+The user ran the verification checklist; every check passed:
+- **Config:** errors for a missing `DATABASE_URL` (importer and api) and
+  `IMPORT_MIN_FILES=9`, all with exit code 1.
+- **Stack start:** `docker compose up --build -d` → importer `Exited (0)`,
+  api `Up`, `/healthz` ok.
+- **Coupons from Postgres:** `HAPPYHRS` → 200; `SUPER100` and `NOTACODE` →
+  422 `invalid coupon: "..."`.
+- **Merging:** 60 + 40 merged → 200 with `quantity:100`; 60 + 41 → 422
+  `total quantity per product must not exceed 100: "1"`; product 99 → 422
+  `unknown product: "99"`.
+- **API key:** none → 401; `a` and a long wrong key → 403.
+- **Shutdown:** `docker compose stop api` → "shutting down" → "server
+  stopped" → "database pool closed".
+
+---
+
+## 2026-09-26: README rewrite and Low-Level Design document
+
+**What**
+- **`README.md`,** rewritten for people running and using the service:
+  - Quick start, prerequisites (Docker with 4 GB or more), project layout,
+    and running with Compose or locally.
+  - All 7 environment variables, with which binary uses each.
+  - API reference with request/response examples and request rules, plus an
+    error table (status → type → when).
+  - Promo-code rules and the 8 valid codes, testing commands, and a
+    troubleshooting table.
+- **`docs/LLD.md`** (new), for people working on the code. Sections:
+  - Scope; package dependency graph and rules; per-domain file layering.
+  - Package responsibilities.
+  - Composition and lifecycle (object graph, startup/shutdown sequence,
+    timeouts).
+  - HTTP layer: middleware order and reasons, 404/405 routing, DecodeJSON
+    rules, response helpers.
+  - Domains: product, order (`Place` algorithm), coupon lookup contract.
+  - Sequence diagrams for GET product and POST order.
+  - Importer: pipeline, steps, streaming reader, `uint64` encoding, merge
+    algorithm, memory profile, idempotency state machine.
+  - Data model, error model, concurrency table, security measures.
+  - Design decisions D1-D7, including the measured all-rows vs valid-only
+    comparison.
+  - Testing strategy, and known limitations with possible fixes.
+- **No duplication between them:** the README covers what and how to use; the
+  LLD covers how it works and why. The design and "why the rule is applied at
+  import time" sections moved from the README into the LLD (§8, §13 D1). Each
+  document links to the other, and the README also links to `CODE_LOG.md`.
+- Mermaid diagrams (8 in the LLD) render on GitHub.
+
+**Verification:** every number and behavior quoted was checked against the
+code (constants, locking, timeouts, limits, 37¹⁰ < 2⁵³), and every relative
+link resolves.
+
+---
+
 ## Open items
 
-- Review fixes 1-3 done (not pushed). Deferred from the review: S2 (move the
+- Review fixes 1-3 and the README/LLD docs pushed to `dev` on 2026-09-27. Deferred from the review: S2 (move the
   importer's SQL into a store), S6 (integration tests for the importer and
   `coupon.Store`), N2 (unknown-field detection matches error text), N3
   (in-memory order store grows forever).
