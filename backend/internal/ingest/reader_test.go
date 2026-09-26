@@ -79,6 +79,32 @@ func TestSourceSkipsLinesLongerThanBuffer(t *testing.T) {
 	}
 }
 
+func TestSourceScanReportsLineNumbers(t *testing.T) {
+	in := gzipLines(t, "SUPER100", "ABC", "", strings.Repeat("X", bufSize*2), "FIFTYOFF")
+
+	src, err := NewSource(in, 1, lengthBetween(8, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+
+	type hit struct {
+		line string
+		no   int64
+	}
+	var got []hit
+	for src.Scan() {
+		got = append(got, hit{string(src.Bytes()), src.LineNumber()})
+	}
+	if err := src.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []hit{{"SUPER100", 1}, {"FIFTYOFF", 5}}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
 func TestNewSourceRejectsNonGzip(t *testing.T) {
 	if _, err := NewSource(strings.NewReader("SUPER100\n"), 1, nil); err == nil {
 		t.Fatal("expected error for non-gzip input")

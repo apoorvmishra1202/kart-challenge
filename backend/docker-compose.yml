@@ -23,6 +23,8 @@ services:
       DATA_DIR: /data
       IMPORT_MAINTENANCE_WORK_MEM: 1GB
       IMPORT_PARALLEL_WORKERS: "4"
+      # "all" (default) or "valid" (experimental, needs ~3-5 GB RAM)
+      IMPORT_MODE: ${IMPORT_MODE:-all}
     volumes:
       - ./data:/data:ro
     depends_on:

@@ -261,7 +261,153 @@ itself.
 
 ---
 
+## 2026-09-26: Optimization committed and pushed
+
+Commit `5e3c737 perf(backend): speed up coupon import index build` on `dev`.
+
+---
+
+## 2026-09-26: Experimental "valid" import mode
+
+**What**
+- **Mode switch:** new env `IMPORT_MODE` accepts `all` (default, unchanged
+  behavior) or `valid`. It is passed through `docker-compose.yml` as
+  `${IMPORT_MODE:-all}`, and `coupon.ParseMode` rejects any other value.
+- **`import_status.mode`:** new `TEXT` column, added with `ADD COLUMN IF NOT
+  EXISTS`.
+  - Each mode has its own status row: `coupon_codes`/`all` and
+    `valid_codes`/`valid`. The skip check matches both name and mode.
+  - A `NULL` mode (rows written before this column existed) is treated as
+    `all`, so the existing full import is still skipped.
+- **"valid" mode** (`internal/coupon/import_valid.go`):
+  1. Reads the 3 files concurrently (errgroup) with the ingest reader.
+  2. Encodes each code of valid length to a `uint64`, failing on any
+     character outside `[A-Z0-9]` with the file, line number and line.
+  3. Runs `slices.Sort` and `slices.Compact` on each file's slice.
+  4. Merges the three slices, keeping values found in at least `MinFiles`
+     files, then frees the per-file slices.
+  5. In one transaction: `TRUNCATE valid_codes`, `COPY` the decoded codes,
+     and upsert the status row.
+- **Encoding** (`internal/coupon/codec.go`): base 37, with '0'-'9' → 1-10
+  and 'A'-'Z' → 11-36. No digit is 0, so codes of different lengths never
+  collide, and 37^10 < 2^64. Within one length, numeric order equals byte
+  order.
+  - `MergeValid` also skips repeated values within a file, so duplicates
+    count once even if a caller skips deduplication.
+- **Slice sizing:** each per-file slice is sized up front from the gzip
+  trailer (uncompressed size ÷ 9 is an upper bound on codes). This avoids
+  append temporarily doubling a ~1 GB array while it grows.
+- **Ingest reader:** added `Scan`, `Bytes` and `LineNumber`, which read
+  without allocating. `Next` is now built on `Scan`, with unchanged behavior.
+- **Logged measurements:**
+  - Per file: lines, codes kept, unique codes, read+encode time, sort+dedupe
+    time.
+  - Overall: merge time, valid count, COPY time, total time.
+  - Peak `HeapAlloc` and `Sys` from sampling `runtime.MemStats` every 200 ms.
+  - Sizes of `valid_codes` and `valid_codes_pkey`.
+  - `load_ms` stores the Go preprocessing time. `index_ms` and `vacuum_ms` are
+    NULL in this mode.
+- **Other:** `logSizes` became `logRelationSizes(table, index)`, and migration
+  001 gained the `mode` column and the `valid_codes` table.
+
+**Why:** An experiment to compare against "all" mode. It stores a small table
+of valid codes instead of 313M rows plus a 9.4 GB index, at the cost of RAM
+at import time and of fixing `MinFiles` at import time.
+
+**Files:** `internal/coupon/codec.go`, `codec_test.go`, `import_valid.go`,
+`import_valid_test.go` (all new); `internal/coupon/import.go`,
+`internal/ingest/reader.go`, `reader_test.go`, `cmd/importer/main.go`,
+`docker-compose.yml`, `migrations/001_create_coupon_tables.sql`.
+
+**Results**
+- `go build`, `go vet` and `go test -race` pass.
+- New tests cover:
+  - Encode/decode round trips for lengths 8, 9 and 10, with no collisions
+    across lengths and order matching byte order.
+  - Rejection of wrong lengths and bad characters.
+  - Merge with codes in 1, 2 and 3 files, and duplicates within a file
+    counting once.
+  - Reading a file with trimming and dedupe, and failing on a bad character
+    with its line number.
+  - `ParseMode`, and line numbers from `Scan`.
+- **Throwaway Postgres (:5433), sample data:**
+  - `valid_codes` = `BIRTHDAY10`, `FIFTYOFF`, `HAPPYHRS`, `SUPER100`, matching
+    "all" mode.
+  - A second run of each mode skipped, including an "all" status row with
+    `mode = NULL`.
+  - `coupon_codes` was untouched, and `IMPORT_MODE=both` exits 1.
+- **Real files scanned with awk:** 0 codes of valid length contain
+  characters outside `[A-Z0-9]`.
+- **Environment:** Docker Desktop's VM has 3.8 GiB of memory; the Mac has
+  8 GiB.
+
+**Notes:** "valid" mode needs roughly 3-5 GB of RAM. That is more than the
+3.8 GiB Docker VM, which Postgres also shares, so on this laptop run the
+importer natively (`go run`) against the compose database, or raise Docker's
+memory limit to 6 GB or more.
+
+---
+
+## 2026-09-26: "valid" mode on full data, compared with "all"
+
+**What:** Ran the importer natively on the Mac, since Docker's VM has only
+3.8 GiB, against the compose database that already held the "all" import.
+
+```sh
+docker compose up -d db
+IMPORT_MODE=valid DATABASE_URL='postgres://shop:shop@localhost:5432/shop?sslmode=disable' DATA_DIR=./data go run ./cmd/importer
+```
+
+(The first attempt failed because Docker Desktop was not running, and
+because zsh treated a pasted `# comment` as arguments. Don't put inline
+comments in commands meant to be pasted.)
+
+**Per file (read and sort run concurrently across files)**
+
+| File | Lines | Unique | Duplicates in file | Read+encode | Sort+dedupe |
+|---|---|---|---|---|---|
+| couponbase1.gz | 107,260,777 | 107,258,700 | 2,077 | 15.3s | 12.5s |
+| couponbase2.gz | 107,260,776 | 107,260,726 | 50 | 16.5s | 12.1s |
+| couponbase3.gz | 98,566,152 | 98,566,151 | 1 | 16.4s | 11.4s |
+
+**"all" vs "valid"**
+
+| | all (optimized) | valid |
+|---|---|---|
+| Total import time | 8m10s | **32s** |
+| Stages | load 59s, index 6m06s, vacuum 1m04s | preprocess 32.0s (incl. merge 3.2s), COPY 29 ms |
+| Rows stored | 313,087,705 | **8** |
+| Table + index | 13 GB + 9.4 GB | 8 kB + 16 kB |
+| Peak importer memory | small (streams rows) | 2,653 MiB heap; 2.52 GB peak footprint (`/usr/bin/time -l`) |
+| Lookup | index-only scan, ~1.5-3 ms cold | index-only scan, 0.25 ms (warm) |
+| Changing `MinFiles` | no re-import | needs re-import |
+
+**Correctness check:** the full-table query in "all" mode
+(`GROUP BY code HAVING COUNT(DISTINCT file_id) >= 2`, 1m27s) returns exactly
+the same 8 codes as `valid_codes`: `BIRTHDAY`, `BUYGETON`, `FIFTYOFF`,
+`FREEZAAA`, `GNULINUX`, `HAPPYHRS`, `OVER9000`, `SIXTYOFF`.
+- `HAPPYHRS` appears in 2 files; the other 7 appear in all 3.
+- All 8 are 8 characters long. `SUPER100` is in only 1 file, so it's invalid.
+
+**Notes**
+- `coupon_codes` was untouched (still 313,087,705 rows). Its status row
+  (`mode` NULL, treated as "all") survived, so the two modes coexist.
+- The real data has very little overlap between files. File 1 is all
+  8-character codes and file 3 is almost all 10-character codes, so only 8
+  codes pass rule 2.
+- Peak memory came in under the 3-5 GB estimate, because the slices are
+  sized up front from the gzip trailer and never grow.
+- The `valid_codes` lookup showed `Heap Fetches: 1` because the table hasn't
+  been vacuumed yet, which doesn't matter for 8 rows.
+- The design decision is still open. "valid" is far cheaper in time and
+  disk; "all" keeps `MinFiles` changeable without a re-import.
+
+---
+
 ## Open items
+
+- Decide whether "valid" mode stays experimental or becomes the default.
+  The lookup/API code currently queries `coupon_codes` only.
 
 - `cmd/api` is still an empty stub; the `api` container exits immediately.
   The next step is to wire up `coupon.NewService(coupon.NewStore(pool)).Validate`.

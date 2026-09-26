@@ -38,6 +38,10 @@ func run(log *slog.Logger) error {
 		}
 	}
 
+	mode, err := coupon.ParseMode(os.Getenv("IMPORT_MODE"))
+	if err != nil {
+		return err
+	}
 	indexOpts, err := coupon.ParseIndexOptions(os.Getenv("IMPORT_MAINTENANCE_WORK_MEM"), os.Getenv("IMPORT_PARALLEL_WORKERS"))
 	if err != nil {
 		return err
@@ -52,5 +56,5 @@ func run(log *slog.Logger) error {
 	}
 	defer pool.Close()
 
-	return coupon.NewImporter(pool, log, indexOpts).Run(ctx, files)
+	return coupon.NewImporter(pool, log, mode, indexOpts).Run(ctx, files)
 }

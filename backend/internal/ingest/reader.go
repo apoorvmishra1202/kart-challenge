@@ -21,6 +21,8 @@ type Source struct {
 	br       *bufio.Reader
 	sourceID int16
 	keep     func([]byte) bool
+	raw      []byte
+	lineNo   int64
 	cur      string
 	err      error
 }
@@ -41,11 +43,23 @@ func NewSource(r io.Reader, sourceID int16, keep func([]byte) bool) (*Source, er
 }
 
 func (s *Source) Next() bool {
+	if !s.Scan() {
+		return false
+	}
+	// Scan's slice is only valid until the next read, so copy it.
+	s.cur = string(s.raw)
+	return true
+}
+
+// Scan advances to the next kept line without allocating. Use Bytes and
+// LineNumber to read it; the slice is only valid until the next call.
+func (s *Source) Scan() bool {
 	for {
 		line, isPrefix, err := s.br.ReadLine()
 		if err != nil {
 			return s.stop(err)
 		}
+		s.lineNo++
 		if isPrefix {
 			// Longer than the buffer: cannot be a valid code, drop the rest of it.
 			for isPrefix {
@@ -60,11 +74,17 @@ func (s *Source) Next() bool {
 		if len(line) == 0 || (s.keep != nil && !s.keep(line)) {
 			continue
 		}
-		// ReadLine's slice is only valid until the next read, so copy it.
-		s.cur = string(line)
+		s.raw = line
 		return true
 	}
 }
+
+// Bytes returns the line found by the last Scan.
+func (s *Source) Bytes() []byte { return s.raw }
+
+// LineNumber is the 1-based physical line number of the last line read,
+// counting skipped lines.
+func (s *Source) LineNumber() int64 { return s.lineNo }
 
 func (s *Source) stop(err error) bool {
 	if err != io.EOF {

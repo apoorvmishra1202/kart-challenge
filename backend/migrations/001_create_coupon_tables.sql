@@ -18,6 +18,14 @@ CREATE TABLE IF NOT EXISTS import_status (
 ALTER TABLE import_status ADD COLUMN IF NOT EXISTS load_ms   BIGINT;
 ALTER TABLE import_status ADD COLUMN IF NOT EXISTS index_ms  BIGINT;
 ALTER TABLE import_status ADD COLUMN IF NOT EXISTS vacuum_ms BIGINT;
+-- Import mode that wrote the row ('all' or 'valid'); NULL means 'all'.
+ALTER TABLE import_status ADD COLUMN IF NOT EXISTS mode      TEXT;
+
+-- Experimental IMPORT_MODE=valid: only codes found in >= 2 files, computed by
+-- the importer in Go.
+CREATE TABLE IF NOT EXISTS valid_codes (
+    code TEXT COLLATE "C" PRIMARY KEY
+);
 
 -- The importer drops this before loading and recreates it afterwards, since
 -- building an index once is much faster than maintaining it during COPY.

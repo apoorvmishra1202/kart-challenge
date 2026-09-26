@@ -31,6 +31,7 @@ var statusSchema = []string{
 	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS load_ms   BIGINT`,
 	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS index_ms  BIGINT`,
 	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS vacuum_ms BIGINT`,
+	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS mode      TEXT`,
 }
 
 // Codes are ASCII uppercase letters and digits, so byte order ("C") sorts
@@ -82,15 +83,39 @@ func (o IndexOptions) Validate() error {
 	return nil
 }
 
-// Importer loads the coupon source files into coupon_codes.
+// Mode selects what the importer stores.
+type Mode string
+
+const (
+	// ModeAll stores every well-formed (code, file_id) row in coupon_codes;
+	// the "at least MinFiles" rule is checked at query time.
+	ModeAll Mode = "all"
+	// ModeValid (experimental) applies the rule in Go and stores only the
+	// valid codes in valid_codes. See runValid.
+	ModeValid Mode = "valid"
+)
+
+// ParseMode reads IMPORT_MODE; empty selects ModeAll.
+func ParseMode(s string) (Mode, error) {
+	switch Mode(s) {
+	case "", ModeAll:
+		return ModeAll, nil
+	case ModeValid:
+		return ModeValid, nil
+	}
+	return "", fmt.Errorf("IMPORT_MODE must be %q or %q, got %q", ModeAll, ModeValid, s)
+}
+
+// Importer loads the coupon source files into Postgres.
 type Importer struct {
 	pool *pgxpool.Pool
 	log  *slog.Logger
+	mode Mode
 	opts IndexOptions
 }
 
-func NewImporter(pool *pgxpool.Pool, log *slog.Logger, opts IndexOptions) *Importer {
-	return &Importer{pool: pool, log: log, opts: opts}
+func NewImporter(pool *pgxpool.Pool, log *slog.Logger, mode Mode, opts IndexOptions) *Importer {
+	return &Importer{pool: pool, log: log, mode: mode, opts: opts}
 }
 
 type phaseTimings struct {
@@ -98,8 +123,13 @@ type phaseTimings struct {
 }
 
 // Run imports files concurrently, assigning file_id 1..n in order. It is a
-// no-op when a previous import completed and its data is still present.
+// no-op when a previous import in the same mode completed and its data is
+// still present. Each mode has its own status row and table, so running one
+// mode never invalidates the other's data.
 func (im *Importer) Run(ctx context.Context, files []string) error {
+	if im.mode == ModeValid {
+		return im.runValid(ctx, files)
+	}
 	if err := im.opts.Validate(); err != nil {
 		return err
 	}
@@ -149,12 +179,8 @@ func (im *Importer) Run(ctx context.Context, files []string) error {
 	}
 
 	_, err = im.pool.Exec(ctx,
-		`INSERT INTO import_status (name, row_count, completed_at, load_ms, index_ms, vacuum_ms)
-		 VALUES ($1, $2, now(), $3, $4, $5)
-		 ON CONFLICT (name) DO UPDATE SET
-		   row_count = EXCLUDED.row_count, completed_at = EXCLUDED.completed_at,
-		   load_ms = EXCLUDED.load_ms, index_ms = EXCLUDED.index_ms, vacuum_ms = EXCLUDED.vacuum_ms`,
-		statusName, total, t.load.Milliseconds(), t.index.Milliseconds(), t.vacuum.Milliseconds())
+		upsertStatus,
+		statusName, total, t.load.Milliseconds(), t.index.Milliseconds(), t.vacuum.Milliseconds(), string(ModeAll))
 	if err != nil {
 		return fmt.Errorf("record import status: %w", err)
 	}
@@ -165,15 +191,29 @@ func (im *Importer) Run(ctx context.Context, files []string) error {
 		"index", t.index.Round(time.Millisecond),
 		"vacuum_analyze", t.vacuum.Round(time.Millisecond),
 		"total", time.Since(start).Round(time.Millisecond))
-	im.logSizes(ctx)
+	im.logRelationSizes(ctx, "coupon_codes", "idx_coupon_code_file")
 	return nil
 }
 
-func (im *Importer) ensureSchema(ctx context.Context) error {
+const upsertStatus = `INSERT INTO import_status (name, row_count, completed_at, load_ms, index_ms, vacuum_ms, mode)
+	 VALUES ($1, $2, now(), $3, $4, $5, $6)
+	 ON CONFLICT (name) DO UPDATE SET
+	   row_count = EXCLUDED.row_count, completed_at = EXCLUDED.completed_at,
+	   load_ms = EXCLUDED.load_ms, index_ms = EXCLUDED.index_ms, vacuum_ms = EXCLUDED.vacuum_ms,
+	   mode = EXCLUDED.mode`
+
+func (im *Importer) ensureStatusSchema(ctx context.Context) error {
 	for _, stmt := range statusSchema {
 		if _, err := im.pool.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("create schema: %w", err)
 		}
+	}
+	return nil
+}
+
+func (im *Importer) ensureSchema(ctx context.Context) error {
+	if err := im.ensureStatusSchema(ctx); err != nil {
+		return err
 	}
 	if err := im.ensureByteOrderCollation(ctx); err != nil {
 		return err
@@ -215,14 +255,16 @@ func (im *Importer) ensureByteOrderCollation(ctx context.Context) error {
 	return nil
 }
 
-// alreadyImported requires both the status row and data: coupon_codes is
-// UNLOGGED, so Postgres empties it after a crash while the status row survives.
+// alreadyImported requires a status row for this mode and data: coupon_codes
+// is UNLOGGED, so Postgres empties it after a crash while the status row
+// survives. Rows written before the mode column existed (mode NULL) came from
+// ModeAll.
 func (im *Importer) alreadyImported(ctx context.Context) (bool, error) {
 	var done bool
 	err := im.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM import_status WHERE name = $1)
+		`SELECT EXISTS (SELECT 1 FROM import_status WHERE name = $1 AND coalesce(mode, 'all') = $2)
 		    AND EXISTS (SELECT 1 FROM coupon_codes)`,
-		statusName).Scan(&done)
+		statusName, string(ModeAll)).Scan(&done)
 	if err != nil {
 		return false, fmt.Errorf("check import status: %w", err)
 	}
@@ -318,15 +360,15 @@ func (im *Importer) buildIndex(ctx context.Context) (indexDur, vacuumDur time.Du
 	return indexDur, vacuumDur, nil
 }
 
-// logSizes is informational only, so a failure is logged, not returned.
-func (im *Importer) logSizes(ctx context.Context) {
-	var table, index string
+// logRelationSizes is informational only, so a failure is logged, not returned.
+func (im *Importer) logRelationSizes(ctx context.Context, table, index string) {
+	var tableSize, indexSize string
 	err := im.pool.QueryRow(ctx,
-		`SELECT pg_size_pretty(pg_relation_size('coupon_codes')),
-		        pg_size_pretty(pg_relation_size('idx_coupon_code_file'))`).Scan(&table, &index)
+		`SELECT pg_size_pretty(pg_relation_size($1::regclass)), pg_size_pretty(pg_relation_size($2::regclass))`,
+		table, index).Scan(&tableSize, &indexSize)
 	if err != nil {
 		im.log.Warn("could not read relation sizes", "err", err)
 		return
 	}
-	im.log.Info("storage", "table_size", table, "index_size", index)
+	im.log.Info("storage", "table", table, "table_size", tableSize, "index", index, "index_size", indexSize)
 }
