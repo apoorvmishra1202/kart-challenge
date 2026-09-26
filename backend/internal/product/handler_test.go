@@ -160,7 +160,7 @@ func TestToProductResponse(t *testing.T) {
 		want  float64
 	}{{650, 6.5}, {1299, 12.99}, {1, 0.01}, {0, 0}, {100000, 1000}}
 	for _, tt := range tests {
-		if got := toProductResponse(Product{Price: tt.cents}).Price; got != tt.want {
+		if got := ToResponse(Product{Price: tt.cents}).Price; got != tt.want {
 			t.Errorf("%d cents -> %v, want %v", tt.cents, got, tt.want)
 		}
 	}

@@ -9,7 +9,9 @@ import (
 	"os"
 
 	"shop/internal/config"
+	"shop/internal/coupon"
 	"shop/internal/httpapi"
+	"shop/internal/order"
 	"shop/internal/product"
 )
 
@@ -38,11 +40,22 @@ func newApp(cfg config.Config, out io.Writer) (*App, error) {
 	}
 	logger := slog.New(h).With("env", cfg.Env)
 
-	products := product.NewHandler(product.NewService(product.NewMemoryStore(product.SeedProducts())))
+	productSvc := product.NewService(product.NewMemoryStore(product.SeedProducts()))
+	// Empty store: every coupon is rejected until the API is wired to
+	// coupon.PostgresStore (valid_codes, filled by cmd/importer).
+	couponSvc := coupon.NewService(coupon.NewMemoryStore())
+	orderSvc := order.NewService(order.NewMemoryStore(), productSvc, couponSvc)
+
+	productHandler := product.NewHandler(productSvc)
+	orderHandler := order.NewHandler(orderSvc, logger)
+	protect := httpapi.APIKey(cfg.APIKey)
 
 	return &App{
-		Config:  cfg,
-		Logger:  logger,
-		Handler: httpapi.NewRouter(logger, products),
+		Config: cfg,
+		Logger: logger,
+		Handler: httpapi.NewRouter(logger,
+			productHandler,
+			httpapi.RegistrarFunc(func(mux *http.ServeMux) { orderHandler.Register(mux, protect) }),
+		),
 	}, nil
 }

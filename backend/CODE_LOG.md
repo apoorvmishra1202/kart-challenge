@@ -667,13 +667,111 @@ no body for 400 and 404, so both use the `APIError` shape.
 
 ---
 
+## 2026-09-26: Order API with coupon validation stub
+
+**What**
+- **`internal/coupon`,** reshaped to the requested API while keeping the real
+  rules and the importer:
+  - `ErrInvalid`.
+  - A `Store` interface (`Has`) declared in `service.go`, with the requested
+    TODO comment plus a note that the importer already loads the codes.
+  - `Service.Validate(ctx, code) error` returns an error matching
+    `ErrInvalid` for malformed or unknown codes (malformed ones skip the
+    store). Store failures come back wrapped as ordinary errors.
+  - `MemoryStore` (a fixed set, empty by default).
+  - The existing Postgres `Store`/`Exists` became `PostgresStore`/`Has`
+    (file `store_postgres.go`); `CodeStore` was replaced by `Store`.
+- **`internal/order`** (new; the empty `store.go` stub was removed):
+  - `Item`, `Order`, `ErrUnknownProduct` and `ErrInvalidCoupon`.
+  - `service.go` declares `ProductLookup`, `CouponValidator` and `Store`.
+  - `Place` merges duplicate product IDs (summing quantities, first-seen
+    order), looks up each product (`product.ErrNotFound` →
+    `ErrUnknownProduct`; other errors stay separate), validates the coupon
+    only when one is given, generates a UUIDv4 with `crypto/rand`, and saves.
+  - `MemoryStore` (map + `sync.Mutex`): copies slices on save and rejects
+    duplicate IDs.
+  - `PlaceOrderRequest.Validate()`: items must be non-empty, `productId`
+    non-empty, quantity 1-100; all problems are reported together.
+  - `OrderResponse{id, items, products}` reuses `product.ToResponse`.
+  - Handler: 400 for any decode failure, 422 for validation errors, unknown
+    products and invalid coupons, 500 with a generic message (real error
+    logged), 200 with the order.
+  - `Register(mux, protect)` wraps `POST /api/order` with `protect`; other
+    methods get a JSON 405 without needing the key.
+- **`internal/product`:** `toProductResponse` exported as `ToResponse` for
+  reuse by order.
+- **`internal/httpapi`:** `RegistrarFunc` (like `http.HandlerFunc`), so
+  `app` can mount `order.Register(mux, protect)` through the router.
+- **`internal/app`:** product service → order service; coupon service with
+  an empty `MemoryStore`; `protect = httpapi.APIKey(cfg.APIKey)`.
+  `*product.Service` and `*coupon.Service` satisfy the order interfaces
+  directly, with no adapter types.
+
+**Why these choices**
+- **How order tells a rejected coupon from a failure:** order may not import
+  coupon, so it can't check `errors.Is(err, coupon.ErrInvalid)`, yet it must
+  not report a database failure as "invalid coupon" (422). Coupon's
+  rejection error also implements `InvalidCoupon() bool`, and order checks
+  for that behavior with `errors.As`, the same pattern as `net.Error`'s
+  `Timeout()`.
+- **Decode failures are all 400:** the spec only allows
+  200/400/401/403/422, so 413 and 415 from `DecodeJSON` become 400 with the
+  original message.
+- **The coupon store is empty for now:** as the task specifies, every coupon
+  is rejected (422) until the API is wired to `PostgresStore`, which needs
+  `DATABASE_URL` in the API config.
+- **Order of checks:** unknown products are checked before the coupon, so a
+  request with both problems reports the product.
+- **Merging can exceed 100:** quantity limits apply per request line, so
+  merged totals can go over 100 (for example 60 + 60).
+
+**Dependency check (`go list`):** product → httpx; coupon → ingest;
+order → httpx, product. product and coupon never import order or each other.
+
+**Files:** `internal/coupon/{coupon,service,store_memory,store_postgres}.go`,
+`coupon_test.go`; `internal/order/{order,service,store_memory,http_types,handler,routes}.go`,
+`service_test.go`, `handler_test.go`; `internal/product/{http_types,handler,handler_test}.go`;
+`internal/httpapi/router.go`; `internal/app/{app,app_test}.go`.
+
+**Results**
+- `go build`, `go vet` and `go test -race` pass.
+- **Service tests,** with fakes for all three interfaces:
+  - Success, merging, valid coupon, invalid coupon, validator failure (not
+    `ErrInvalidCoupon`), unknown product, unknown product reported before the
+    coupon, lookup failure (not `ErrUnknownProduct`), and save failure.
+  - Each checks what was saved and which codes reached the validator.
+  - Also UUIDv4 format and uniqueness, and that `MemoryStore` copies and
+    rejects duplicate IDs.
+- **Handler tests** (httptest with the real `APIKey` middleware):
+  - 200 (exactly the fields id, items and products, with merging and a
+    coupon).
+  - 401 and 403, checked before the body is read.
+  - 400: malformed JSON, empty body, unknown field, wrong types, wrong
+    content type, oversized body.
+  - 422: missing or empty items, missing productId or quantity, quantity
+    0/-1/101, every item error reported, unknown product, invalid coupon.
+  - 500: generic message, no leak, real error logged; plus a 405.
+- **Coupon tests:** `Validate` returns nil, `ErrInvalid` plus
+  `InvalidCoupon()` for unknown, short, long or empty codes (the latter
+  without a store call), and a plain error for a store failure. `MemoryStore`
+  is tested too.
+- **App test:** `POST /api/order` returns 200, 401 or 403 depending on the
+  key, and 422 for a coupon.
+- **Smoke test of the binary:**
+  - 200: duplicates merged (1×2 + 1×1 → quantity 3); response has a UUID id,
+    items and products.
+  - 401 without a key, 403 with a wrong key, 400 for malformed JSON.
+  - 422 for empty items, unknown product 99, and coupon `HAPPYHRS` (empty
+    store).
+
+---
+
 ## Open items
 
-- Product API done (`GET /api/product`, `GET /api/product/{productId}`). Next:
-  `POST /api/order` per `api/openapi.yaml` (api_key auth), with coupon
-  validation through
-  `coupon.NewService(coupon.NewStore(pool)).Validate`. The API also needs
-  `DATABASE_URL` added to its config for that.
+- Product and order APIs done. Next: wire real coupons into the API by adding
+  `DATABASE_URL` to `config.Config`, building a pgx pool in `app`, and using
+  `coupon.NewPostgresStore(pool)` instead of the empty `MemoryStore`. Then
+  have `api` in docker-compose use the database the importer filled.
 - Still planned: `scripts/stats.sql` + `make stats`, `make verify`, and an
   integration test.
 - `f1a2d1f`, `6f6b080` and the Docker-timing docs commit pushed to `dev` on 2026-09-26.

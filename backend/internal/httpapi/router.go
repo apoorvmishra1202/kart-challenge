@@ -13,6 +13,12 @@ type Registrar interface {
 	Register(mux *http.ServeMux)
 }
 
+// RegistrarFunc adapts a function to a Registrar, like http.HandlerFunc. Use it
+// for handlers whose Register needs extra arguments, such as middleware.
+type RegistrarFunc func(mux *http.ServeMux)
+
+func (f RegistrarFunc) Register(mux *http.ServeMux) { f(mux) }
+
 // NewRouter returns the API handler with the standard middleware applied and
 // every registrar's routes mounted. Unknown routes get a JSON 404 and known
 // paths with the wrong method a JSON 405, both in the APIError shape.

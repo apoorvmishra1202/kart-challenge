@@ -45,6 +45,27 @@ func TestNew(t *testing.T) {
 			if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"1"`) {
 				t.Errorf("product route not wired: %d %s", w.Code, w.Body)
 			}
+			for _, c := range []struct {
+				key, body string
+				want      int
+			}{
+				{tt.cfg.APIKey, `{"items":[{"productId":"1","quantity":1}]}`, http.StatusOK},
+				{"", `{"items":[{"productId":"1","quantity":1}]}`, http.StatusUnauthorized},
+				{"wrong", `{"items":[{"productId":"1","quantity":1}]}`, http.StatusForbidden},
+				// No coupons are loaded yet, so any code is rejected.
+				{tt.cfg.APIKey, `{"couponCode":"HAPPYHRS","items":[{"productId":"1","quantity":1}]}`, http.StatusUnprocessableEntity},
+			} {
+				r := httptest.NewRequest(http.MethodPost, "/api/order", strings.NewReader(c.body))
+				r.Header.Set("Content-Type", "application/json")
+				if c.key != "" {
+					r.Header.Set("api_key", c.key)
+				}
+				w = httptest.NewRecorder()
+				a.Handler.ServeHTTP(w, r)
+				if w.Code != c.want {
+					t.Errorf("POST /api/order key=%q: status %d, want %d; %s", c.key, w.Code, c.want, w.Body)
+				}
+			}
 			if isJSON := strings.HasPrefix(out.String(), "{"); isJSON != tt.wantJSON {
 				t.Errorf("log output %q, want JSON = %v", out.String(), tt.wantJSON)
 			}

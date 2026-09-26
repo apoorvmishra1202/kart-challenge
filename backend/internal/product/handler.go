@@ -25,7 +25,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]ProductResponse, 0, len(products))
 	for _, p := range products {
-		out = append(out, toProductResponse(p))
+		out = append(out, ToResponse(p))
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }
@@ -43,7 +43,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, toProductResponse(p))
+	httpx.WriteJSON(w, http.StatusOK, ToResponse(p))
 }
 
 // parseProductID accepts only digits (no sign) forming a positive int64 and

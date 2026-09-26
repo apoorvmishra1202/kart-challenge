@@ -30,60 +30,66 @@ func TestIsWellFormed(t *testing.T) {
 }
 
 type fakeStore struct {
-	exists bool
-	err    error
-	calls  int
+	has   bool
+	err   error
+	calls int
 }
 
-func (f *fakeStore) Exists(context.Context, string) (bool, error) {
+func (f *fakeStore) Has(context.Context, string) (bool, error) {
 	f.calls++
-	return f.exists, f.err
+	return f.has, f.err
 }
 
 func TestServiceValidate(t *testing.T) {
+	dbDown := errors.New("db down")
 	tests := []struct {
-		name   string
-		exists bool
-		want   bool
+		name        string
+		code        string
+		store       *fakeStore
+		wantInvalid bool  // error matches ErrInvalid and reports InvalidCoupon()
+		wantErr     error // other error expected (store failure)
+		wantCalls   int
 	}{
-		{"not in valid_codes", false, false},
-		{"in valid_codes", true, true},
+		{"known code", "HAPPYHRS", &fakeStore{has: true}, false, nil, 1},
+		{"unknown code", "HAPPYHRS", &fakeStore{has: false}, true, nil, 1},
+		{"too short skips store", "ABC", &fakeStore{has: true}, true, nil, 0},
+		{"too long skips store", "WAYTOOLONGCODE", &fakeStore{has: true}, true, nil, 0},
+		{"empty skips store", "", &fakeStore{has: true}, true, nil, 0},
+		{"store failure is not a verdict", "HAPPYHRS", &fakeStore{err: dbDown}, false, dbDown, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			store := &fakeStore{exists: tt.exists}
-			got, err := NewService(store).Validate(context.Background(), "HAPPYHRS")
-			if err != nil {
-				t.Fatal(err)
+			err := NewService(tt.store).Validate(context.Background(), tt.code)
+
+			var ic interface{ InvalidCoupon() bool }
+			isInvalid := errors.Is(err, ErrInvalid)
+			reportsInvalid := errors.As(err, &ic) && ic.InvalidCoupon()
+			if isInvalid != tt.wantInvalid || reportsInvalid != tt.wantInvalid {
+				t.Errorf("err = %v: Is(ErrInvalid) = %v, InvalidCoupon() = %v, want %v",
+					err, isInvalid, reportsInvalid, tt.wantInvalid)
 			}
-			if got != tt.want {
-				t.Errorf("Validate = %v, want %v", got, tt.want)
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Errorf("err = %v, want %v", err, tt.wantErr)
 			}
-			if store.calls != 1 {
-				t.Errorf("store called %d times, want 1", store.calls)
+			if !tt.wantInvalid && tt.wantErr == nil && err != nil {
+				t.Errorf("err = %v, want nil", err)
+			}
+			if tt.store.calls != tt.wantCalls {
+				t.Errorf("store called %d times, want %d", tt.store.calls, tt.wantCalls)
 			}
 		})
 	}
 }
 
-func TestServiceValidateMalformedSkipsStore(t *testing.T) {
-	store := &fakeStore{exists: true}
-	got, err := NewService(store).Validate(context.Background(), "ABC")
-	if err != nil {
-		t.Fatal(err)
+func TestMemoryStore(t *testing.T) {
+	ctx := context.Background()
+	if ok, err := NewMemoryStore().Has(ctx, "HAPPYHRS"); ok || err != nil {
+		t.Errorf("empty store Has = %v, %v; want false, nil", ok, err)
 	}
-	if got {
-		t.Error("malformed code reported valid")
-	}
-	if store.calls != 0 {
-		t.Errorf("store called %d times, want 0", store.calls)
-	}
-}
-
-func TestServiceValidateStoreError(t *testing.T) {
-	wantErr := errors.New("db down")
-	_, err := NewService(&fakeStore{err: wantErr}).Validate(context.Background(), "HAPPYHRS")
-	if !errors.Is(err, wantErr) {
-		t.Errorf("err = %v, want %v", err, wantErr)
+	s := NewMemoryStore("HAPPYHRS", "FIFTYOFF")
+	for code, want := range map[string]bool{"HAPPYHRS": true, "FIFTYOFF": true, "happyhrs": false, "SUPER100": false} {
+		if ok, err := s.Has(ctx, code); ok != want || err != nil {
+			t.Errorf("Has(%q) = %v, %v; want %v", code, ok, err, want)
+		}
 	}
 }

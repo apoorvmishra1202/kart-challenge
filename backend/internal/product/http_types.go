@@ -8,8 +8,9 @@ type ProductResponse struct {
 	Category string  `json:"category"`
 }
 
-// toProductResponse converts cents to the spec's float price (650 -> 6.5).
-func toProductResponse(p Product) ProductResponse {
+// ToResponse converts a Product to the spec shape, turning cents into the
+// float price (650 -> 6.5). The order package reuses it.
+func ToResponse(p Product) ProductResponse {
 	return ProductResponse{
 		ID:       p.ID,
 		Name:     p.Name,

@@ -5,9 +5,14 @@
 package coupon
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 )
+
+// ErrInvalid means a coupon code was rejected: malformed or not a known
+// valid code.
+var ErrInvalid = errors.New("invalid coupon")
 
 const (
 	MinLength = 8
