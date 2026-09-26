@@ -512,10 +512,98 @@ running inside Docker.
 
 ---
 
+## 2026-09-26: Shared HTTP plumbing (config, helpers, server)
+
+**What** (standard library only; no domain code yet)
+- **`internal/config`:** `Config{Env, HTTPAddr, LogLevel, APIKey}`.
+  - `Load()` reads `APP_ENV` (default `development`), `HTTP_ADDR` (`:8080`),
+    `LOG_LEVEL` (`info`) and `API_KEY` (`apitest`, the key from the OpenAPI
+    example).
+  - `Validate()` reports every problem at once: env must be
+    development/test/production, the address must be `host:port` with a port
+    of 0-65535, the log level must be debug/info/warn/error, the key must not
+    be empty, and the default key is rejected in production.
+  - `SlogLevel()` converts the level for the logger.
+- **`internal/httpx`:**
+  - `APIError{code,type,message}`, matching `ApiResponse` in the spec.
+  - `WriteJSON` and `WriteError`. `WriteError` turns any status below 400
+    into 500, so an error is never sent with a success code.
+  - Error type constants (`not_found`, `unauthorized`, ...).
+  - `DecodeJSON[T]` uses `MaxBytesReader` and `DisallowUnknownFields`. It
+    accepts `application/json` with any parameters (charset), and rejects
+    empty bodies and trailing data.
+  - Every `DecodeJSON` error is a `*RequestError{Status, Type, Message}`:
+    415 wrong media type, 413 too large, 400 malformed JSON, wrong field type,
+    unknown field, empty body or multiple values.
+- **`internal/httpapi`:**
+  - `RequestID` reuses a well-formed `X-Request-ID` (printable, 128 chars or
+    fewer) or generates 32 hex characters, and exposes it via
+    `RequestIDFrom(ctx)`.
+  - `Logger(*slog.Logger)` logs method, path, status, bytes, duration and
+    request ID (errors for 5xx).
+  - `Recover(*slog.Logger)` turns a panic into a 500 APIError and logs it
+    with its stack. It re-panics `http.ErrAbortHandler` and doesn't overwrite
+    a response already started.
+  - `APIKey(key)`: 401 when the `api_key` header is missing or empty, 403 when
+    it's wrong (constant-time comparison).
+  - `NewRouter(logger)`: `GET /healthz` returns `{"status":"ok"}`; other
+    methods on `/healthz` get a JSON 405 with `Allow: GET, HEAD`; any other
+    path gets a JSON 404. Middleware order: RequestID → Logger → Recover.
+- **`internal/app`:** `New(cfg)` validates the config and builds the logger
+  (JSON in production, text otherwise) and the router. It is the only place
+  that wires dependencies.
+- **`cmd/api`:**
+  - Opens the listener before serving, so a bad or busy address exits 1.
+  - Timeouts: ReadHeader 5s, Read 10s, Write 15s, Idle 60s.
+  - Graceful shutdown on SIGINT/SIGTERM with a 10s limit.
+  - Startup errors go to stderr with exit code 1.
+- **`cmd/importer`:** now reads `DATABASE_URL` and `DATA_DIR` itself, because
+  `config.Config` is the API's config. The importer's behavior is unchanged.
+
+**Why these choices**
+- **`Recover` takes a logger:** so panics are logged with their stack; the
+  task listed it without a signature.
+- **`Load` returns only `Config`:** defaults can't fail, and all checks live
+  in `Validate`.
+- **JSON 405 for wrong methods:** without it, a method-less catch-all would
+  have turned a wrong method into a 404.
+
+**Files:** `internal/config/config.go`, `internal/httpx/{request,response}.go`,
+`internal/httpapi/{middleware,router}.go`, `internal/app/app.go`,
+`cmd/api/main.go`, `cmd/importer/main.go`, plus tests: `config_test.go`,
+`request_test.go`, `response_test.go`, `middleware_test.go`,
+`router_test.go`, `app_test.go`.
+
+**Results**
+- `go build`, `go vet` and `go test -race` pass.
+- Table-driven tests:
+  - Config: `Load` defaults, set values and empty values; 15 `Validate`
+    cases; all errors reported together.
+  - `DecodeJSON`: 19 cases, including charset variants, 415, 413, syntax
+    errors, truncation, wrong types, unknown fields and trailing data.
+  - `APIKey`: 9 cases, including missing, empty, wrong, prefix, suffix, case,
+    and a header name in any case.
+  - Also `WriteError` (never 2xx or 3xx), router 200/404/405, `Recover`,
+    `RequestID`, the `Logger` fields, and `app.New`.
+- **Smoke test of the binary:**
+  - `/healthz` returns 200 with JSON and an `X-Request-Id`.
+  - An unknown route returns a JSON 404; `POST /healthz` a JSON 405.
+  - A busy port exits 1.
+  - SIGTERM logs "shutting down" then "server stopped".
+  - Bad config (`APP_ENV=prod`, `LOG_LEVEL=loud`) lists both errors and exits
+    1; production with the default key exits 1.
+- **Rules check:** no `fmt.Print` or `log.Fatal` outside `main`, no
+  utils/common/helpers packages, no new dependencies, and nothing changed
+  outside `backend/`.
+
+---
+
 ## Open items
 
-- `cmd/api` is still an empty stub; the `api` container exits immediately.
-  The next step is to wire up `coupon.NewService(coupon.NewStore(pool)).Validate`.
+- API plumbing is in place (`cmd/api` serves `/healthz`). Next: product and
+  order handlers per `api/openapi.yaml`, with coupon validation through
+  `coupon.NewService(coupon.NewStore(pool)).Validate`. The API also needs
+  `DATABASE_URL` added to its config for that.
 - Still planned: `scripts/stats.sql` + `make stats`, `make verify`, and an
   integration test.
 - `f1a2d1f`, `6f6b080` and the Docker-timing docs commit pushed to `dev` on 2026-09-26.

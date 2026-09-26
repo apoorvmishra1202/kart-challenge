@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"shop/internal/config"
 	"shop/internal/coupon"
 	"shop/internal/database"
 )
@@ -25,16 +24,20 @@ func main() {
 }
 
 func run(log *slog.Logger) error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return fmt.Errorf("DATABASE_URL is required")
+	}
+	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" {
+		dataDir = "./data"
 	}
 
 	files := make([]string, len(sourceFiles))
 	for i, name := range sourceFiles {
-		files[i] = filepath.Join(cfg.DataDir, name)
+		files[i] = filepath.Join(dataDir, name)
 		if _, err := os.Stat(files[i]); err != nil {
-			return fmt.Errorf("coupon file %s not found in DATA_DIR %q: %w", name, cfg.DataDir, err)
+			return fmt.Errorf("coupon file %s not found in DATA_DIR %q: %w", name, dataDir, err)
 		}
 	}
 
@@ -46,7 +49,7 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := database.NewPool(ctx, cfg.DatabaseURL)
+	pool, err := database.NewPool(ctx, databaseURL)
 	if err != nil {
 		return err
 	}
