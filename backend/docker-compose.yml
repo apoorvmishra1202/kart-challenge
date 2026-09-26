@@ -1,7 +1,6 @@
 services:
   db:
     image: postgres:16
-    shm_size: 1g # parallel index builds use shared memory
     environment:
       POSTGRES_USER: shop
       POSTGRES_PASSWORD: shop
@@ -21,10 +20,9 @@ services:
     environment:
       DATABASE_URL: postgres://shop:shop@db:5432/shop?sslmode=disable
       DATA_DIR: /data
-      IMPORT_MAINTENANCE_WORK_MEM: 1GB
-      IMPORT_PARALLEL_WORKERS: "4"
-      # "all" (default) or "valid" (experimental, needs ~3-5 GB RAM)
-      IMPORT_MODE: ${IMPORT_MODE:-all}
+      # A code is valid if it appears in at least this many files (1-3).
+      # Changing it triggers a re-import (~30s). The import needs >= 4 GB RAM.
+      IMPORT_MIN_FILES: ${IMPORT_MIN_FILES:-2}
     volumes:
       - ./data:/data:ro
     depends_on:

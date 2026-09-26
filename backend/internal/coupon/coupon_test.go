@@ -30,43 +30,44 @@ func TestIsWellFormed(t *testing.T) {
 }
 
 type fakeStore struct {
-	count int
-	err   error
-	calls int
+	exists bool
+	err    error
+	calls  int
 }
 
-func (f *fakeStore) CountFiles(context.Context, string) (int, error) {
+func (f *fakeStore) Exists(context.Context, string) (bool, error) {
 	f.calls++
-	return f.count, f.err
+	return f.exists, f.err
 }
 
 func TestServiceValidate(t *testing.T) {
 	tests := []struct {
-		name  string
-		count int
-		want  bool
+		name   string
+		exists bool
+		want   bool
 	}{
-		{"in no files", 0, false},
-		{"in one file", 1, false},
-		{"in two files", 2, true},
-		{"in three files", 3, true},
+		{"not in valid_codes", false, false},
+		{"in valid_codes", true, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := NewService(&fakeStore{count: tt.count})
-			got, err := svc.Validate(context.Background(), "HAPPYHRS")
+			store := &fakeStore{exists: tt.exists}
+			got, err := NewService(store).Validate(context.Background(), "HAPPYHRS")
 			if err != nil {
 				t.Fatal(err)
 			}
 			if got != tt.want {
-				t.Errorf("Validate with count %d = %v, want %v", tt.count, got, tt.want)
+				t.Errorf("Validate = %v, want %v", got, tt.want)
+			}
+			if store.calls != 1 {
+				t.Errorf("store called %d times, want 1", store.calls)
 			}
 		})
 	}
 }
 
 func TestServiceValidateMalformedSkipsStore(t *testing.T) {
-	store := &fakeStore{count: 3}
+	store := &fakeStore{exists: true}
 	got, err := NewService(store).Validate(context.Background(), "ABC")
 	if err != nil {
 		t.Fatal(err)

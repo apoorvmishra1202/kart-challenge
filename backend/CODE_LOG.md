@@ -404,12 +404,87 @@ the same 8 codes as `valid_codes`: `BIRTHDAY`, `BUYGETON`, `FIFTYOFF`,
 
 ---
 
+## 2026-09-26: Experiment committed
+
+Commit `f1a2d1f feat(backend): experimental "valid" import mode` on `dev`
+(local; not pushed at the time of writing).
+
+---
+
+## 2026-09-26: "valid" mode becomes the design; "all" mode removed
+
+**What**
+- **Importer** (`internal/coupon/import.go`, rewritten):
+  - Always runs the encode → sort → merge pipeline into `valid_codes`.
+  - Removed: `IMPORT_MODE`, the per-row `COPY` into `coupon_codes`, the index
+    build, VACUUM, `IMPORT_MAINTENANCE_WORK_MEM`, `IMPORT_PARALLEL_WORKERS`,
+    `IndexOptions`, `Mode`, and the collation-migration code.
+    `import_valid.go` was merged into `import.go`.
+- **`IMPORT_MIN_FILES`** (default 2, must be 1-3): parsed by
+  `coupon.ParseMinFiles` and stored in `import_status.min_files`.
+  - A run is skipped only if a completed import used the same `min_files`.
+  - A different value, or an older row with `min_files` NULL, re-imports
+    automatically.
+  - `MinFiles` became `DefaultMinFiles`; `SourceFiles = 3` is the upper bound.
+- **Legacy cleanup:** on startup, if `coupon_codes` exists, the importer drops
+  it (`DROP TABLE IF EXISTS`), deletes its status row, and logs
+  "dropped legacy coupon_codes table to reclaim disk space".
+  - `import_status` loses `index_ms`, `vacuum_ms` and `mode` (via
+    `DROP COLUMN IF EXISTS`) and gains `min_files`.
+- **Migrations:** added `002_valid_codes_only.sql` (drops `coupon_codes` and
+  its status row, drops the unused status columns, adds `min_files`).
+  - `001` was left unchanged: it's already pushed and there's no migration
+    runner, so a new migration is cleaner than rewriting history.
+- **Lookup:** `Store.CountFiles` became `Store.Exists`, running
+  `SELECT EXISTS (SELECT 1 FROM valid_codes WHERE code = $1)`.
+  - `Service.Validate` still rejects malformed codes before querying.
+  - The `FileCounter` interface became `CodeStore`.
+- **Compose:** removed `shm_size` (only parallel index builds needed it) and
+  the three unused importer env vars; added `IMPORT_MIN_FILES`.
+- **README:** rewritten with requirements (Docker memory >= 4 GB), env vars,
+  the final design, the measured comparison table, and why this design was
+  chosen.
+
+**Why:** On the full data it took 32s instead of 8m10s and uses 8 kB + 16 kB
+instead of 13 GB + 9.4 GB, with identical results. The only advantage of the
+old design (changing the rule without a re-import) is now covered by
+`IMPORT_MIN_FILES`, since a re-import takes about 32s.
+
+**Files:** `internal/coupon/{coupon,import,store,service}.go`,
+`internal/coupon/{coupon,codec,import}_test.go`, `cmd/importer/main.go`,
+`docker-compose.yml`, `migrations/002_valid_codes_only.sql` (new),
+`README.md`. Removed: `internal/coupon/import_valid.go`,
+`import_valid_test.go`.
+
+**Results**
+- `go build`, `go vet` and `go test -race` pass.
+- New tests: `ParseMinFiles` (accepts 1-3 and empty; rejects 0, 4, -1,
+  "two", " 2", "2.0"), `MergeValid` with `minFiles` 1, 2 and 3, and service
+  tests using a fake `Exists` store.
+- **End to end on a throwaway Postgres (:5433), sample data**, seeded with the
+  legacy layout (`coupon_codes` table, a status row with
+  `mode`/`index_ms`/`vacuum_ms`, and a stale `valid_codes` row):
+  1. Dropped `coupon_codes` and logged it; imported 4 valid codes and replaced
+     the stale one.
+  2. Same settings again: skipped.
+  3. `IMPORT_MIN_FILES=3`: 1 code. `=1`: 7 codes. Back to `2`: 4 codes.
+     Each change re-imported.
+  4. `IMPORT_MIN_FILES=4`: exits 1 with a clear error.
+  5. Final state: no `coupon_codes`, one status row with `min_files = 2`, and
+     `valid_codes` = `BIRTHDAY10`, `FIFTYOFF`, `HAPPYHRS`, `SUPER100`.
+- Not yet run on the real Docker volume, which still holds the ~22 GB
+  `coupon_codes` table.
+
+---
+
 ## Open items
 
-- Decide whether "valid" mode stays experimental or becomes the default.
-  The lookup/API code currently queries `coupon_codes` only.
-
+- Verify end to end on the real volume: the importer should drop
+  `coupon_codes`, the Docker disk usage should shrink, and `valid_codes`
+  should hold 8 codes.
+- Docker Desktop's VM has 3.8 GiB; the README requires 4 GB or more. Raise it
+  before running the importer in Docker, or run it natively with `go run`.
 - `cmd/api` is still an empty stub; the `api` container exits immediately.
   The next step is to wire up `coupon.NewService(coupon.NewStore(pool)).Validate`.
-- Still planned: `scripts/stats.sql` + `make stats`, `make verify`, an
-  integration test, and the README Performance and Requirements sections.
+- Still planned: `scripts/stats.sql` + `make stats`, `make verify`, and an
+  integration test.

@@ -15,13 +15,14 @@ func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-// CountFiles returns how many distinct source files contain code.
-func (s *Store) CountFiles(ctx context.Context, code string) (int, error) {
-	var n int
+// Exists reports whether code is in valid_codes, which the importer fills
+// with codes that already passed the min-files rule.
+func (s *Store) Exists(ctx context.Context, code string) (bool, error) {
+	var ok bool
 	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(DISTINCT file_id) FROM coupon_codes WHERE code = $1`, code).Scan(&n)
+		`SELECT EXISTS (SELECT 1 FROM valid_codes WHERE code = $1)`, code).Scan(&ok)
 	if err != nil {
-		return 0, fmt.Errorf("count files for coupon: %w", err)
+		return false, fmt.Errorf("look up coupon: %w", err)
 	}
-	return n, nil
+	return ok, nil
 }

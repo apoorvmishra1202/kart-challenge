@@ -1,14 +1,27 @@
 package coupon
 
+// The importer applies the min-files rule in Go and stores only valid codes:
+//
+//  1. Read the files concurrently, encoding each code into a uint64 (codec.go).
+//  2. Sort and dedupe each file's slice.
+//  3. Merge the sorted slices; keep values present in >= minFiles of them.
+//  4. COPY the decoded valid codes into valid_codes.
+//
+// MEMORY: every encoded code is held in RAM at once. The full data set is
+// ~313M codes at 8 bytes each; measured peak heap is ~2.65 GB, so the
+// container needs at least 4 GB of memory (Docker Desktop's limit), or the
+// importer is OOM-killed (exit code 137).
+
 import (
 	"context"
-	"errors"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
+	"runtime"
+	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,346 +31,233 @@ import (
 	"shop/internal/ingest"
 )
 
-const statusName = "coupon_codes"
+const statusName = "valid_codes"
 
-// Kept in sync with migrations/001_create_coupon_tables.sql. coupon_codes is
-// created separately, after ensureByteOrderCollation has run.
-var statusSchema = []string{
+// Kept in sync with migrations/. The ALTERs migrate databases created by
+// earlier importer versions.
+var schema = []string{
 	`CREATE TABLE IF NOT EXISTS import_status (
 		name         TEXT PRIMARY KEY,
 		row_count    BIGINT NOT NULL,
 		completed_at TIMESTAMPTZ NOT NULL
 	)`,
 	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS load_ms   BIGINT`,
-	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS index_ms  BIGINT`,
-	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS vacuum_ms BIGINT`,
-	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS mode      TEXT`,
+	`ALTER TABLE import_status ADD COLUMN IF NOT EXISTS min_files INT`,
+	`ALTER TABLE import_status DROP COLUMN IF EXISTS index_ms`,
+	`ALTER TABLE import_status DROP COLUMN IF EXISTS vacuum_ms`,
+	`ALTER TABLE import_status DROP COLUMN IF EXISTS mode`,
+	`CREATE TABLE IF NOT EXISTS valid_codes (
+		code TEXT COLLATE "C" PRIMARY KEY
+	)`,
 }
 
-// Codes are ASCII uppercase letters and digits, so byte order ("C") sorts
-// them correctly and is much cheaper than a linguistic collation.
-const codesSchema = `CREATE UNLOGGED TABLE IF NOT EXISTS coupon_codes (
-	code    TEXT COLLATE "C" NOT NULL,
-	file_id SMALLINT NOT NULL
-)`
-
-const (
-	DefaultMaintenanceWorkMem = "1GB"
-	DefaultParallelWorkers    = 4
-	maxParallelWorkers        = 16
-)
-
-var workMemPattern = regexp.MustCompile(`^[0-9]+(kB|MB|GB)$`)
-
-// IndexOptions tune the index build. The values are interpolated into SET
-// statements (which cannot take bind parameters), so they must be validated.
-type IndexOptions struct {
-	MaintenanceWorkMem string
-	ParallelWorkers    int
-}
-
-// ParseIndexOptions builds IndexOptions from raw env values; empty strings
-// select the defaults.
-func ParseIndexOptions(workMem, workers string) (IndexOptions, error) {
-	opts := IndexOptions{MaintenanceWorkMem: DefaultMaintenanceWorkMem, ParallelWorkers: DefaultParallelWorkers}
-	if workMem != "" {
-		opts.MaintenanceWorkMem = workMem
-	}
-	if workers != "" {
-		n, err := strconv.Atoi(workers)
-		if err != nil {
-			return IndexOptions{}, fmt.Errorf("IMPORT_PARALLEL_WORKERS must be an integer from 0 to %d, got %q", maxParallelWorkers, workers)
-		}
-		opts.ParallelWorkers = n
-	}
-	return opts, opts.Validate()
-}
-
-func (o IndexOptions) Validate() error {
-	if !workMemPattern.MatchString(o.MaintenanceWorkMem) {
-		return fmt.Errorf("IMPORT_MAINTENANCE_WORK_MEM must look like 512MB or 1GB (units kB, MB, GB), got %q", o.MaintenanceWorkMem)
-	}
-	if o.ParallelWorkers < 0 || o.ParallelWorkers > maxParallelWorkers {
-		return fmt.Errorf("IMPORT_PARALLEL_WORKERS must be an integer from 0 to %d, got %d", maxParallelWorkers, o.ParallelWorkers)
-	}
-	return nil
-}
-
-// Mode selects what the importer stores.
-type Mode string
-
-const (
-	// ModeAll stores every well-formed (code, file_id) row in coupon_codes;
-	// the "at least MinFiles" rule is checked at query time.
-	ModeAll Mode = "all"
-	// ModeValid (experimental) applies the rule in Go and stores only the
-	// valid codes in valid_codes. See runValid.
-	ModeValid Mode = "valid"
-)
-
-// ParseMode reads IMPORT_MODE; empty selects ModeAll.
-func ParseMode(s string) (Mode, error) {
-	switch Mode(s) {
-	case "", ModeAll:
-		return ModeAll, nil
-	case ModeValid:
-		return ModeValid, nil
-	}
-	return "", fmt.Errorf("IMPORT_MODE must be %q or %q, got %q", ModeAll, ModeValid, s)
-}
-
-// Importer loads the coupon source files into Postgres.
+// Importer loads the coupon source files into valid_codes.
 type Importer struct {
-	pool *pgxpool.Pool
-	log  *slog.Logger
-	mode Mode
-	opts IndexOptions
+	pool     *pgxpool.Pool
+	log      *slog.Logger
+	minFiles int
 }
 
-func NewImporter(pool *pgxpool.Pool, log *slog.Logger, mode Mode, opts IndexOptions) *Importer {
-	return &Importer{pool: pool, log: log, mode: mode, opts: opts}
+func NewImporter(pool *pgxpool.Pool, log *slog.Logger, minFiles int) *Importer {
+	return &Importer{pool: pool, log: log, minFiles: minFiles}
 }
 
-type phaseTimings struct {
-	load, index, vacuum time.Duration
-}
-
-// Run imports files concurrently, assigning file_id 1..n in order. It is a
-// no-op when a previous import in the same mode completed and its data is
-// still present. Each mode has its own status row and table, so running one
-// mode never invalidates the other's data.
+// Run imports files. It is a no-op when a previous import with the same
+// minFiles completed; a different minFiles triggers a fresh import.
 func (im *Importer) Run(ctx context.Context, files []string) error {
-	if im.mode == ModeValid {
-		return im.runValid(ctx, files)
-	}
-	if err := im.opts.Validate(); err != nil {
-		return err
-	}
 	start := time.Now()
+	peak := startMemSampler(200 * time.Millisecond)
 
-	if err := im.ensureSchema(ctx); err != nil {
+	if err := im.dropLegacyTable(ctx); err != nil {
 		return err
 	}
+	for _, stmt := range schema {
+		if _, err := im.pool.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("create schema: %w", err)
+		}
+	}
 
-	done, err := im.alreadyImported(ctx)
+	var done bool
+	err := im.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM import_status WHERE name = $1 AND min_files = $2)`,
+		statusName, im.minFiles).Scan(&done)
 	if err != nil {
-		return err
+		return fmt.Errorf("check import status: %w", err)
 	}
 	if done {
-		im.log.Info("coupon codes already imported, skipping")
+		im.log.Info("valid codes already imported, skipping", "min_files", im.minFiles)
 		return nil
 	}
 
-	if err := im.reset(ctx); err != nil {
-		return err
-	}
-
-	var t phaseTimings
-	loadStart := time.Now()
-	counts := make([]int64, len(files))
+	// 1-2. Read, encode, sort and dedupe each file concurrently.
+	prepStart := time.Now()
+	sets := make([][]uint64, len(files))
 	g, gctx := errgroup.WithContext(ctx)
 	for i, path := range files {
 		g.Go(func() error {
-			n, err := im.loadFile(gctx, path, int16(i+1))
-			counts[i] = n
+			codes, err := im.readSortedFile(gctx, path)
+			sets[i] = codes
 			return err
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return err
 	}
-	t.load = time.Since(loadStart)
 
-	var total int64
-	for _, n := range counts {
-		total += n
-	}
-	im.log.Info("load complete", "rows", total, "duration", t.load.Round(time.Millisecond))
+	// 3. Merge, then drop the per-file slices before the COPY.
+	mergeStart := time.Now()
+	valid := MergeValid(sets, im.minFiles)
+	mergeDur := time.Since(mergeStart)
+	clear(sets)
+	sets = nil
+	debug.FreeOSMemory()
+	prepDur := time.Since(prepStart)
+	im.log.Info("merge complete", "valid_codes", len(valid), "min_files", im.minFiles,
+		"duration", mergeDur.Round(time.Millisecond))
 
-	if t.index, t.vacuum, err = im.buildIndex(ctx); err != nil {
+	// 4. Replace valid_codes and record status atomically.
+	copyStart := time.Now()
+	n, err := im.writeValid(ctx, valid, prepDur)
+	if err != nil {
 		return err
 	}
+	copyDur := time.Since(copyStart)
 
-	_, err = im.pool.Exec(ctx,
-		upsertStatus,
-		statusName, total, t.load.Milliseconds(), t.index.Milliseconds(), t.vacuum.Milliseconds(), string(ModeAll))
-	if err != nil {
-		return fmt.Errorf("record import status: %w", err)
-	}
-
+	heap, sys := peak()
 	im.log.Info("import complete",
-		"rows", total,
-		"load", t.load.Round(time.Millisecond),
-		"index", t.index.Round(time.Millisecond),
-		"vacuum_analyze", t.vacuum.Round(time.Millisecond),
-		"total", time.Since(start).Round(time.Millisecond))
-	im.logRelationSizes(ctx, "coupon_codes", "idx_coupon_code_file")
+		"valid_codes", n,
+		"min_files", im.minFiles,
+		"preprocess", prepDur.Round(time.Millisecond),
+		"merge", mergeDur.Round(time.Millisecond),
+		"copy", copyDur.Round(time.Millisecond),
+		"total", time.Since(start).Round(time.Millisecond),
+		"peak_heap_alloc", mib(heap),
+		"peak_sys", mib(sys))
+	im.logRelationSizes(ctx, "valid_codes", "valid_codes_pkey")
 	return nil
 }
 
-const upsertStatus = `INSERT INTO import_status (name, row_count, completed_at, load_ms, index_ms, vacuum_ms, mode)
-	 VALUES ($1, $2, now(), $3, $4, $5, $6)
-	 ON CONFLICT (name) DO UPDATE SET
-	   row_count = EXCLUDED.row_count, completed_at = EXCLUDED.completed_at,
-	   load_ms = EXCLUDED.load_ms, index_ms = EXCLUDED.index_ms, vacuum_ms = EXCLUDED.vacuum_ms,
-	   mode = EXCLUDED.mode`
-
-func (im *Importer) ensureStatusSchema(ctx context.Context) error {
-	for _, stmt := range statusSchema {
-		if _, err := im.pool.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("create schema: %w", err)
-		}
+// dropLegacyTable removes coupon_codes, which earlier versions filled with
+// every (code, file_id) row (~22 GB with its index), and its status row.
+func (im *Importer) dropLegacyTable(ctx context.Context) error {
+	var exists bool
+	if err := im.pool.QueryRow(ctx, `SELECT to_regclass('coupon_codes') IS NOT NULL`).Scan(&exists); err != nil {
+		return fmt.Errorf("check legacy coupon_codes: %w", err)
 	}
-	return nil
-}
-
-func (im *Importer) ensureSchema(ctx context.Context) error {
-	if err := im.ensureStatusSchema(ctx); err != nil {
-		return err
-	}
-	if err := im.ensureByteOrderCollation(ctx); err != nil {
-		return err
-	}
-	if _, err := im.pool.Exec(ctx, codesSchema); err != nil {
-		return fmt.Errorf("create schema: %w", err)
-	}
-	return nil
-}
-
-// ensureByteOrderCollation drops a coupon_codes table left by an older schema
-// whose code column is not COLLATE "C", so an existing volume is rebuilt
-// instead of silently keeping the slower schema.
-func (im *Importer) ensureByteOrderCollation(ctx context.Context) error {
-	var collation string
-	err := im.pool.QueryRow(ctx,
-		`SELECT coalesce(c.collname, '')
-		   FROM pg_attribute a
-		   LEFT JOIN pg_collation c ON c.oid = a.attcollation
-		  WHERE a.attrelid = to_regclass('coupon_codes')
-		    AND a.attname = 'code' AND NOT a.attisdropped`).Scan(&collation)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil // table does not exist yet
-	}
-	if err != nil {
-		return fmt.Errorf("check coupon_codes collation: %w", err)
-	}
-	if collation == "C" {
+	if !exists {
 		return nil
 	}
-
-	im.log.Warn("coupon_codes uses a non-C collation, dropping it for a rebuild", "collation", collation)
-	if _, err := im.pool.Exec(ctx, `DROP TABLE coupon_codes`); err != nil {
-		return fmt.Errorf("drop old coupon_codes: %w", err)
+	if _, err := im.pool.Exec(ctx, `DROP TABLE IF EXISTS coupon_codes`); err != nil {
+		return fmt.Errorf("drop legacy coupon_codes: %w", err)
 	}
-	if _, err := im.pool.Exec(ctx, `DELETE FROM import_status WHERE name = $1`, statusName); err != nil {
-		return fmt.Errorf("clear import status: %w", err)
+	// import_status may not exist yet on a database that only has coupon_codes.
+	if _, err := im.pool.Exec(ctx, `DO $$ BEGIN
+		IF to_regclass('import_status') IS NOT NULL THEN
+			DELETE FROM import_status WHERE name = 'coupon_codes';
+		END IF;
+	END $$`); err != nil {
+		return fmt.Errorf("clear legacy import status: %w", err)
 	}
+	im.log.Info("dropped legacy coupon_codes table to reclaim disk space")
 	return nil
 }
 
-// alreadyImported requires a status row for this mode and data: coupon_codes
-// is UNLOGGED, so Postgres empties it after a crash while the status row
-// survives. Rows written before the mode column existed (mode NULL) came from
-// ModeAll.
-func (im *Importer) alreadyImported(ctx context.Context) (bool, error) {
-	var done bool
-	err := im.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM import_status WHERE name = $1 AND coalesce(mode, 'all') = $2)
-		    AND EXISTS (SELECT 1 FROM coupon_codes)`,
-		statusName, string(ModeAll)).Scan(&done)
-	if err != nil {
-		return false, fmt.Errorf("check import status: %w", err)
-	}
-	return done, nil
-}
-
-// reset clears anything left by a partial or stale run.
-func (im *Importer) reset(ctx context.Context) error {
-	for _, stmt := range []string{
-		`DROP INDEX IF EXISTS idx_coupon_code_file`,
-		`TRUNCATE coupon_codes`,
-	} {
-		if _, err := im.pool.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("reset: %w", err)
-		}
-	}
-	if _, err := im.pool.Exec(ctx, `DELETE FROM import_status WHERE name = $1`, statusName); err != nil {
-		return fmt.Errorf("reset: %w", err)
-	}
-	return nil
-}
-
-func (im *Importer) loadFile(ctx context.Context, path string, fileID int16) (int64, error) {
+// readSortedFile streams one file, encodes every code of valid length, and
+// returns the sorted, deduplicated values. A code of valid length containing a
+// character outside [A-Z0-9] fails the import rather than being skipped.
+func (im *Importer) readSortedFile(ctx context.Context, path string) ([]uint64, error) {
 	name := filepath.Base(path)
 	start := time.Now()
-	im.log.Info("loading file", "file", name, "file_id", fileID)
 
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, fmt.Errorf("open %s: %w", name, err)
+		return nil, fmt.Errorf("open %s: %w", name, err)
 	}
 	defer f.Close()
 
-	src, err := ingest.NewSource(f, fileID, func(line []byte) bool { return validLength(len(line)) })
+	src, err := ingest.NewSource(f, 0, func(line []byte) bool { return validLength(len(line)) })
 	if err != nil {
-		return 0, fmt.Errorf("%s: %w", name, err)
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	defer src.Close()
 
-	n, err := im.pool.CopyFrom(ctx, pgx.Identifier{"coupon_codes"}, []string{"code", "file_id"}, src)
-	if err != nil {
-		return n, fmt.Errorf("copy %s: %w", name, err)
+	codes := make([]uint64, 0, capacityHint(f))
+	for src.Scan() {
+		v, ok := encode(src.Bytes())
+		if !ok {
+			return nil, fmt.Errorf("%s line %d: invalid code %q: only A-Z and 0-9 are allowed",
+				name, src.LineNumber(), src.Bytes())
+		}
+		codes = append(codes, v)
+		if len(codes)%(1<<20) == 0 && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 	}
+	if err := src.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	readDur := time.Since(start)
+	kept := len(codes)
 
-	im.log.Info("loaded file", "file", name, "rows", n, "duration", time.Since(start).Round(time.Millisecond))
-	return n, nil
+	sortStart := time.Now()
+	codes = SortUnique(codes)
+	im.log.Info("file preprocessed", "file", name,
+		"lines", src.LineNumber(), "codes_kept", kept, "unique", len(codes),
+		"read_encode", readDur.Round(time.Millisecond),
+		"sort_dedupe", time.Since(sortStart).Round(time.Millisecond))
+	return codes, nil
 }
 
-// buildIndex runs on a single connection so the SET values apply to CREATE
-// INDEX and VACUUM. VACUUM sets the visibility map, which is what lets lookups
-// use index-only scans without heap fetches; it cannot run in a transaction,
-// so it is a plain Exec.
-func (im *Importer) buildIndex(ctx context.Context) (indexDur, vacuumDur time.Duration, err error) {
-	conn, err := im.pool.Acquire(ctx)
+// capacityHint sizes the per-file slice up front so append never has to grow
+// (and briefly double) a ~1 GB backing array. The gzip trailer's ISIZE field
+// is the uncompressed size mod 2^32; each kept line takes at least
+// MinLength+1 bytes, so ISIZE/(MinLength+1) is an upper bound on kept codes.
+// It is only a hint: a wrong value costs memory or a regrow, never correctness.
+func capacityHint(f *os.File) int {
+	var trailer [4]byte
+	info, err := f.Stat()
+	if err != nil || info.Size() < int64(len(trailer)) {
+		return 0
+	}
+	if _, err := f.ReadAt(trailer[:], info.Size()-int64(len(trailer))); err != nil {
+		return 0
+	}
+	return int(binary.LittleEndian.Uint32(trailer[:]) / (MinLength + 1))
+}
+
+func (im *Importer) writeValid(ctx context.Context, valid []uint64, prepDur time.Duration) (int64, error) {
+	tx, err := im.pool.Begin(ctx)
 	if err != nil {
-		return 0, 0, fmt.Errorf("acquire connection: %w", err)
+		return 0, fmt.Errorf("begin: %w", err)
 	}
-	defer conn.Release()
+	defer tx.Rollback(ctx)
 
-	// Values were validated by IndexOptions.Validate.
-	settings := []string{
-		fmt.Sprintf(`SET maintenance_work_mem = '%s'`, im.opts.MaintenanceWorkMem),
-		fmt.Sprintf(`SET max_parallel_maintenance_workers = %d`, im.opts.ParallelWorkers),
+	if _, err := tx.Exec(ctx, `TRUNCATE valid_codes`); err != nil {
+		return 0, fmt.Errorf("truncate valid_codes: %w", err)
 	}
-	for _, stmt := range settings {
-		if _, err := conn.Exec(ctx, stmt); err != nil {
-			return 0, 0, fmt.Errorf("configure index build: %w", err)
-		}
+	n, err := tx.CopyFrom(ctx, pgx.Identifier{"valid_codes"}, []string{"code"},
+		pgx.CopyFromSlice(len(valid), func(i int) ([]any, error) {
+			return []any{Decode(valid[i])}, nil
+		}))
+	if err != nil {
+		return 0, fmt.Errorf("copy valid_codes: %w", err)
 	}
 
-	im.log.Info("building index", "index", "idx_coupon_code_file",
-		"maintenance_work_mem", im.opts.MaintenanceWorkMem, "parallel_workers", im.opts.ParallelWorkers)
-	start := time.Now()
-	if _, err := conn.Exec(ctx, `CREATE INDEX idx_coupon_code_file ON coupon_codes (code, file_id)`); err != nil {
-		return 0, 0, fmt.Errorf("create index: %w", err)
+	// load_ms is the Go preprocessing time (read, sort, merge).
+	_, err = tx.Exec(ctx,
+		`INSERT INTO import_status (name, row_count, completed_at, load_ms, min_files)
+		 VALUES ($1, $2, now(), $3, $4)
+		 ON CONFLICT (name) DO UPDATE SET
+		   row_count = EXCLUDED.row_count, completed_at = EXCLUDED.completed_at,
+		   load_ms = EXCLUDED.load_ms, min_files = EXCLUDED.min_files`,
+		statusName, n, prepDur.Milliseconds(), im.minFiles)
+	if err != nil {
+		return 0, fmt.Errorf("record import status: %w", err)
 	}
-	indexDur = time.Since(start)
-	im.log.Info("index built", "duration", indexDur.Round(time.Millisecond))
-
-	im.log.Info("vacuum analyze", "table", "coupon_codes")
-	start = time.Now()
-	if _, err := conn.Exec(ctx, `VACUUM (ANALYZE) coupon_codes`); err != nil {
-		return indexDur, 0, fmt.Errorf("vacuum analyze: %w", err)
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
 	}
-	vacuumDur = time.Since(start)
-	im.log.Info("vacuum analyze done", "duration", vacuumDur.Round(time.Millisecond))
-
-	for _, stmt := range []string{`RESET maintenance_work_mem`, `RESET max_parallel_maintenance_workers`} {
-		if _, err := conn.Exec(ctx, stmt); err != nil {
-			return indexDur, vacuumDur, fmt.Errorf("reset settings: %w", err)
-		}
-	}
-	return indexDur, vacuumDur, nil
+	return n, nil
 }
 
 // logRelationSizes is informational only, so a failure is logged, not returned.
@@ -372,3 +272,45 @@ func (im *Importer) logRelationSizes(ctx context.Context, table, index string) {
 	}
 	im.log.Info("storage", "table", table, "table_size", tableSize, "index", index, "index_size", indexSize)
 }
+
+// startMemSampler polls runtime.MemStats until the returned function is
+// called, which stops sampling and reports the peak HeapAlloc and Sys.
+func startMemSampler(every time.Duration) func() (heap, sys uint64) {
+	var (
+		mu              sync.Mutex
+		maxHeap, maxSys uint64
+		stop            = make(chan struct{})
+		done            = make(chan struct{})
+	)
+	sample := func() {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		mu.Lock()
+		maxHeap = max(maxHeap, m.HeapAlloc)
+		maxSys = max(maxSys, m.Sys)
+		mu.Unlock()
+	}
+	go func() {
+		defer close(done)
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				sample()
+			}
+		}
+	}()
+	return func() (uint64, uint64) {
+		close(stop)
+		<-done
+		sample()
+		mu.Lock()
+		defer mu.Unlock()
+		return maxHeap, maxSys
+	}
+}
+
+func mib(b uint64) string { return fmt.Sprintf("%.0f MiB", float64(b)/(1<<20)) }

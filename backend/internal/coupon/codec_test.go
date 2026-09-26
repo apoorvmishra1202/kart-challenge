@@ -106,11 +106,28 @@ func TestMergeValid(t *testing.T) {
 			for i, f := range tt.files {
 				files[i] = SortUnique(enc(t, f...))
 			}
-			got := dec(MergeValid(files, MinFiles))
+			got := dec(MergeValid(files, DefaultMinFiles))
 			if !slices.Equal(got, tt.want) && !(len(got) == 0 && len(tt.want) == 0) {
 				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMergeValidMinFiles(t *testing.T) {
+	files := [][]uint64{
+		SortUnique(enc(t, "ONLYFILE1", "INTWO123", "INALL333")),
+		SortUnique(enc(t, "INTWO123", "INALL333")),
+		SortUnique(enc(t, "INALL333")),
+	}
+	for minFiles, want := range map[int][]string{
+		1: {"INALL333", "INTWO123", "ONLYFILE1"},
+		2: {"INALL333", "INTWO123"},
+		3: {"INALL333"},
+	} {
+		if got := dec(MergeValid(files, minFiles)); !slices.Equal(got, want) {
+			t.Errorf("minFiles=%d: got %v, want %v", minFiles, got, want)
+		}
 	}
 }
 
@@ -119,11 +136,11 @@ func TestMergeValidWithoutPriorDedupe(t *testing.T) {
 	// the caller skipped SortUnique's compaction.
 	a := enc(t, "DUPEDUPE", "DUPEDUPE")
 	b := enc(t, "DUPEDUPE", "DUPEDUPE")
-	got := dec(MergeValid([][]uint64{a, b, nil}, MinFiles))
+	got := dec(MergeValid([][]uint64{a, b, nil}, DefaultMinFiles))
 	if !slices.Equal(got, []string{"DUPEDUPE"}) {
 		t.Errorf("got %v, want [DUPEDUPE]", got)
 	}
-	got = dec(MergeValid([][]uint64{a, nil, nil}, MinFiles))
+	got = dec(MergeValid([][]uint64{a, nil, nil}, DefaultMinFiles))
 	if len(got) != 0 {
 		t.Errorf("got %v, want none", got)
 	}

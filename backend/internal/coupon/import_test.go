@@ -1,35 +1,91 @@
 package coupon
 
-import "testing"
+import (
+	"compress/gzip"
+	"context"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+)
 
-func TestParseIndexOptions(t *testing.T) {
-	tests := []struct {
-		name         string
-		mem, workers string
-		want         IndexOptions
-		wantErr      bool
-	}{
-		{"defaults", "", "", IndexOptions{"1GB", 4}, false},
-		{"explicit", "512MB", "8", IndexOptions{"512MB", 8}, false},
-		{"kB and zero workers", "65536kB", "0", IndexOptions{"65536kB", 0}, false},
-		{"max workers", "2GB", "16", IndexOptions{"2GB", 16}, false},
-		{"too many workers", "1GB", "17", IndexOptions{}, true},
-		{"negative workers", "1GB", "-1", IndexOptions{}, true},
-		{"non-integer workers", "1GB", "4; DROP TABLE x", IndexOptions{}, true},
-		{"no unit", "1024", "", IndexOptions{}, true},
-		{"lowercase unit", "1gb", "", IndexOptions{}, true},
-		{"injection", "1GB'; DROP TABLE coupon_codes; --", "", IndexOptions{}, true},
-		{"space", "1 GB", "", IndexOptions{}, true},
+func writeGzip(t *testing.T, lines ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "codes.gz")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseIndexOptions(tt.mem, tt.workers)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
-			}
-			if !tt.wantErr && got != tt.want {
-				t.Errorf("got %+v, want %+v", got, tt.want)
-			}
-		})
+	zw := gzip.NewWriter(f)
+	if _, err := zw.Write([]byte(strings.Join(lines, "\n") + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func testImporter() *Importer {
+	return NewImporter(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), DefaultMinFiles)
+}
+
+func TestReadSortedFile(t *testing.T) {
+	path := writeGzip(t, "SUPER100", "ABC", "HAPPYHRS\r", "  SUPER100  ", "WAYTOOLONGCODE", "", "BIRTHDAY10")
+
+	got, err := testImporter().readSortedFile(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"HAPPYHRS", "SUPER100", "BIRTHDAY10"} // sorted, deduped
+	if d := dec(got); !slices.Equal(d, want) {
+		t.Errorf("got %v, want %v", d, want)
+	}
+}
+
+func TestReadSortedFileRejectsInvalidCharacter(t *testing.T) {
+	// Wrong-length lines are skipped, but a valid-length line with a bad
+	// character must fail with its line number.
+	path := writeGzip(t, "SUPER100", "abc", "HAPPYHRS", "SUPER-10", "FIFTYOFF")
+
+	_, err := testImporter().readSortedFile(context.Background(), path)
+	if err == nil {
+		t.Fatal("expected error for invalid character")
+	}
+	for _, want := range []string{"codes.gz", "line 4", `"SUPER-10"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
+	}
+}
+
+func TestCapacityHintIsUpperBound(t *testing.T) {
+	path := writeGzip(t, "SUPER100", "HAPPYHRS", "BIRTHDAY10")
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if hint := capacityHint(f); hint < 3 {
+		t.Errorf("capacityHint = %d, want >= 3", hint)
+	}
+}
+
+func TestParseMinFiles(t *testing.T) {
+	for in, want := range map[string]int{"": DefaultMinFiles, "1": 1, "2": 2, "3": 3} {
+		if got, err := ParseMinFiles(in); err != nil || got != want {
+			t.Errorf("ParseMinFiles(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"0", "4", "-1", "two", " 2", "2.0"} {
+		if _, err := ParseMinFiles(in); err == nil {
+			t.Errorf("ParseMinFiles(%q) succeeded, want error", in)
+		}
 	}
 }

@@ -2,16 +2,16 @@ package coupon
 
 import "context"
 
-// FileCounter is the storage dependency of Service; *Store implements it.
-type FileCounter interface {
-	CountFiles(ctx context.Context, code string) (int, error)
+// CodeStore is the storage dependency of Service; *Store implements it.
+type CodeStore interface {
+	Exists(ctx context.Context, code string) (bool, error)
 }
 
 type Service struct {
-	store FileCounter
+	store CodeStore
 }
 
-func NewService(store FileCounter) *Service {
+func NewService(store CodeStore) *Service {
 	return &Service{store: store}
 }
 
@@ -21,9 +21,5 @@ func (s *Service) Validate(ctx context.Context, code string) (bool, error) {
 	if !IsWellFormed(code) {
 		return false, nil
 	}
-	n, err := s.store.CountFiles(ctx, code)
-	if err != nil {
-		return false, err
-	}
-	return n >= MinFiles, nil
+	return s.store.Exists(ctx, code)
 }
